@@ -16,10 +16,11 @@ import scala.sys.process.*
 import java.nio.file.{Files, Paths}
 import java.nio.charset.StandardCharsets
 
-/** ペイン単位の状態 */
+/** ペイン単位の状態。runningCommand はdump時点でフォアグラウンドで動いていたコマンド名 */
 case class PaneState(
   paneIndex: Int,
   currentPath: String,
+  runningCommand: String,
   gitRoot: Option[String],
   branch: Option[String],
   isWorktree: Boolean
@@ -74,8 +75,8 @@ def runCapture(cmd: Seq[String]): Option[String] = {
 def dump(): Unit = {
   if (!isTmuxRunning) { return }
 
-  // ペイン単位で session/window/layout/pane 情報をまとめて取得する
-  val format = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}"
+  // ペイン単位で session/window/layout/pane/command 情報をまとめて取得する
+  val format = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}"
   runCapture(Seq("tmux", "list-panes", "-a", "-F", format)) match {
     case None => return
     case Some(raw) => {
@@ -96,16 +97,17 @@ def buildWindows(lines: List[String]): List[WindowState] = {
     windowName: String,
     windowLayout: String,
     paneIndex: Int,
-    currentPath: String
+    currentPath: String,
+    command: String
   )
 
   val rawPanes: List[RawPane] = lines.flatMap { line =>
     line.split("\t") match {
-      case Array(session, widxStr, wname, layout, pidxStr, path) =>
+      case Array(session, widxStr, wname, layout, pidxStr, path, cmd) =>
         for {
           widx <- widxStr.toIntOption
           pidx <- pidxStr.toIntOption
-        } yield RawPane(session, widx, wname, layout, pidx, path)
+        } yield RawPane(session, widx, wname, layout, pidx, path, cmd)
       case _ => None
     }
   }
@@ -123,7 +125,7 @@ def buildWindows(lines: List[String]): List[WindowState] = {
     val layout     = sorted.head.windowLayout
     val paneStates = sorted.map { rp =>
       val (gitRoot, branch, isWorktree) = gitInfo(rp.currentPath)
-      PaneState(rp.paneIndex, rp.currentPath, gitRoot, branch, isWorktree)
+      PaneState(rp.paneIndex, rp.currentPath, rp.command, gitRoot, branch, isWorktree)
     }
     WindowState(session, widx, windowName, layout, paneStates)
   }
@@ -180,14 +182,15 @@ def restore(): Unit = {
   }
 }
 
-/** 1ウィンドウ分を復元する。複数ペインがあればsplit-windowで追加し、最後にレイアウトを適用する */
+/** 1ウィンドウ分を復元する。複数ペインがあればsplit-windowで追加し、最後にレイアウトを適用する。
+ *  claude が動いていたペインには claude -c を送り込んでセッションを再開する。 */
 def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit = {
   val sortedPanes = w.panes.sortBy(_.paneIndex)
   val firstPane   = sortedPanes.head
 
   // ウィンドウを作成し、実際に割り当てられたインデックスを取得する。
   // ウィンドウ名が重複する場合でも正確にターゲットできるようインデックスで扱う。
-  val actualIndex: Int = if (isFirstWindow) {
+  val actualWindowIndex: Int = if (isFirstWindow) {
     Process(Seq("tmux", "new-session", "-d", "-s", session, "-n", w.windowName, "-c", firstPane.currentPath)).!
     runCapture(Seq("tmux", "display-message", "-p", "-t", session, "#{window_index}"))
       .flatMap(_.trim.toIntOption)
@@ -198,15 +201,33 @@ def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit 
       .getOrElse(w.windowIndex)
   }
 
-  val target = s"$session:$actualIndex"
+  val target = s"$session:$actualWindowIndex"
 
-  // 2ペイン目以降を split-window で追加する
+  // 最初のペインの実際のインデックスを取得し、(実インデックス, 保存済みペイン) のペアを追跡する
+  val firstActualPaneIndex = runCapture(Seq("tmux", "display-message", "-p", "-t", target, "#{pane_index}"))
+    .flatMap(_.trim.toIntOption)
+    .getOrElse(0)
+
+  val paneMapping = scala.collection.mutable.ListBuffer((firstActualPaneIndex, firstPane))
+
+  // 2ペイン目以降を split-window で追加し、割り当てられたインデックスを記録する
   sortedPanes.tail.foreach { pane =>
-    Process(Seq("tmux", "split-window", "-t", target, "-c", pane.currentPath)).!
+    val newPaneIndex = runCapture(Seq("tmux", "split-window", "-P", "-F", "#{pane_index}", "-t", target, "-c", pane.currentPath))
+      .flatMap(_.trim.toIntOption)
+      .getOrElse(-1)
+    paneMapping += ((newPaneIndex, pane))
   }
 
   // 複数ペインがある場合は保存済みレイアウトを適用する
   if (sortedPanes.size > 1) {
     Process(Seq("tmux", "select-layout", "-t", target, w.windowLayout)).!
+  }
+
+  // claude が動いていたペインには claude -c を送り込み、
+  // そのディレクトリの直近の会話を再開する（-c はピッカーを開かず自動再開する）
+  paneMapping.foreach { case (actualPaneIndex, savedPane) =>
+    if (savedPane.runningCommand == "claude") {
+      Process(Seq("tmux", "send-keys", "-t", s"$target.$actualPaneIndex", "claude -c", "Enter")).!
+    }
   }
 }

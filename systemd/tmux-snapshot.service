@@ -1,0 +1,7 @@
+[Unit]
+Description=Save tmux/worktree snapshot
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmux-snapshot dump
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
