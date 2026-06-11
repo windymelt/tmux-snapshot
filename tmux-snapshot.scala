@@ -3,6 +3,7 @@
 //> using dep io.circe::circe-core::0.14.15
 //> using dep io.circe::circe-generic::0.14.15
 //> using dep io.circe::circe-parser::0.14.15
+//> using dep io.github.cquiroz::scala-java-time::2.6.0
 //> using nativeMode release-fast
 //> using nativeLto thin
 //> using mainClass Main
@@ -15,19 +16,27 @@ import scala.sys.process.*
 import java.nio.file.{Files, Paths}
 import java.nio.charset.StandardCharsets
 
-/** tmuxの各ウィンドウ（アクティブペインのパスを含む）とgit情報を表す */
-case class WindowState(
-  session: String,
-  windowIndex: Int,
-  windowName: String,
+/** ペイン単位の状態 */
+case class PaneState(
+  paneIndex: Int,
   currentPath: String,
   gitRoot: Option[String],
   branch: Option[String],
   isWorktree: Boolean
 ) derives Codec.AsObject
 
+/** ウィンドウ単位の状態。windowLayout はtmuxのレイアウト文字列 */
+case class WindowState(
+  session: String,
+  windowIndex: Int,
+  windowName: String,
+  windowLayout: String,
+  panes: List[PaneState]
+) derives Codec.AsObject
+
 /** 保存時刻と全ウィンドウ状態のスナップショット */
 case class Snapshot(
+  version: Int,
   savedAt: String,
   windows: List[WindowState]
 ) derives Codec.AsObject
@@ -52,7 +61,6 @@ object Main {
   }
 }
 
-/** tmuxサーバーが起動中かどうかを確認する */
 def isTmuxRunning: Boolean = {
   Process(Seq("tmux", "list-sessions")).run(sink).exitValue() == 0
 }
@@ -64,32 +72,60 @@ def runCapture(cmd: Seq[String]): Option[String] = {
 }
 
 def dump(): Unit = {
-  // tmuxが起動していない場合は何もしない
   if (!isTmuxRunning) { return }
 
-  // session_name, window_index, window_name, アクティブペインのカレントディレクトリを取得
-  val format = "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_current_path}"
-  runCapture(Seq("tmux", "list-windows", "-a", "-F", format)) match {
+  // ペイン単位で session/window/layout/pane 情報をまとめて取得する
+  val format = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}"
+  runCapture(Seq("tmux", "list-panes", "-a", "-F", format)) match {
     case None => return
     case Some(raw) => {
-      val windows  = raw.trim.linesIterator.toList.flatMap(parseLine)
-      val snapshot = Snapshot(java.time.Instant.now().toString, windows)
+      val windows  = buildWindows(raw.trim.linesIterator.toList)
+      val snapshot = Snapshot(version = 0, savedAt = java.time.Instant.now().toString, windows = windows)
       Files.createDirectories(stateDir)
       Files.write(stateFile, snapshot.asJson.spaces2.getBytes(StandardCharsets.UTF_8))
-      println(s"Saved ${windows.size} window(s) → $stateFile")
+      println(s"Saved ${windows.size} window(s), ${windows.map(_.panes.size).sum} pane(s) → $stateFile")
     }
   }
 }
 
-/** タブ区切りの1行をWindowStateにパースする */
-def parseLine(line: String): Option[WindowState] = {
-  line.split("\t") match {
-    case Array(session, idxStr, name, path) => {
-      val idx                         = idxStr.toIntOption.getOrElse(0)
-      val (gitRoot, branch, isWorktree) = gitInfo(path)
-      Some(WindowState(session, idx, name, path, gitRoot, branch, isWorktree))
+/** タブ区切り行のリストをWindowStateのリストに変換する。ウィンドウ出現順を保持する */
+def buildWindows(lines: List[String]): List[WindowState] = {
+  case class RawPane(
+    session: String,
+    windowIndex: Int,
+    windowName: String,
+    windowLayout: String,
+    paneIndex: Int,
+    currentPath: String
+  )
+
+  val rawPanes: List[RawPane] = lines.flatMap { line =>
+    line.split("\t") match {
+      case Array(session, widxStr, wname, layout, pidxStr, path) =>
+        for {
+          widx <- widxStr.toIntOption
+          pidx <- pidxStr.toIntOption
+        } yield RawPane(session, widx, wname, layout, pidx, path)
+      case _ => None
     }
-    case _ => None
+  }
+
+  // LinkedHashMap で (session, windowIndex) をキーに出現順を保持しながらグループ化する
+  val grouped = scala.collection.mutable.LinkedHashMap.empty[(String, Int), List[RawPane]]
+  rawPanes.foreach { rp =>
+    val key = (rp.session, rp.windowIndex)
+    grouped(key) = grouped.getOrElse(key, Nil) :+ rp
+  }
+
+  grouped.toList.map { case ((session, widx), panes) =>
+    val sorted     = panes.sortBy(_.paneIndex)
+    val windowName = sorted.head.windowName
+    val layout     = sorted.head.windowLayout
+    val paneStates = sorted.map { rp =>
+      val (gitRoot, branch, isWorktree) = gitInfo(rp.currentPath)
+      PaneState(rp.paneIndex, rp.currentPath, gitRoot, branch, isWorktree)
+    }
+    WindowState(session, widx, windowName, layout, paneStates)
   }
 }
 
@@ -133,20 +169,44 @@ def restore(): Unit = {
         val exists = Process(Seq("tmux", "has-session", "-t", sessionName)).run(sink).exitValue() == 0
         val sorted = windows.sortBy(_.windowIndex)
         if (!exists) {
-          // セッションごと新規作成し、先頭ウィンドウをそのまま初期ウィンドウとして使う
-          val h = sorted.head
-          Process(Seq("tmux", "new-session", "-d", "-s", sessionName, "-n", h.windowName, "-c", h.currentPath)).!
-          sorted.tail.foreach { w =>
-            Process(Seq("tmux", "new-window", "-t", sessionName, "-n", w.windowName, "-c", w.currentPath)).!
-          }
+          createWindow(sessionName, sorted.head, isFirstWindow = true)
+          sorted.tail.foreach(w => createWindow(sessionName, w, isFirstWindow = false))
         } else {
-          // 既存セッションにウィンドウを追加する
-          sorted.foreach { w =>
-            Process(Seq("tmux", "new-window", "-t", sessionName, "-n", w.windowName, "-c", w.currentPath)).!
-          }
+          sorted.foreach(w => createWindow(sessionName, w, isFirstWindow = false))
         }
       }
       println("Done.")
     }
+  }
+}
+
+/** 1ウィンドウ分を復元する。複数ペインがあればsplit-windowで追加し、最後にレイアウトを適用する */
+def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit = {
+  val sortedPanes = w.panes.sortBy(_.paneIndex)
+  val firstPane   = sortedPanes.head
+
+  // ウィンドウを作成し、実際に割り当てられたインデックスを取得する。
+  // ウィンドウ名が重複する場合でも正確にターゲットできるようインデックスで扱う。
+  val actualIndex: Int = if (isFirstWindow) {
+    Process(Seq("tmux", "new-session", "-d", "-s", session, "-n", w.windowName, "-c", firstPane.currentPath)).!
+    runCapture(Seq("tmux", "display-message", "-p", "-t", session, "#{window_index}"))
+      .flatMap(_.trim.toIntOption)
+      .getOrElse(0)
+  } else {
+    runCapture(Seq("tmux", "new-window", "-P", "-F", "#{window_index}", "-t", session, "-n", w.windowName, "-c", firstPane.currentPath))
+      .flatMap(_.trim.toIntOption)
+      .getOrElse(w.windowIndex)
+  }
+
+  val target = s"$session:$actualIndex"
+
+  // 2ペイン目以降を split-window で追加する
+  sortedPanes.tail.foreach { pane =>
+    Process(Seq("tmux", "split-window", "-t", target, "-c", pane.currentPath)).!
+  }
+
+  // 複数ペインがある場合は保存済みレイアウトを適用する
+  if (sortedPanes.size > 1) {
+    Process(Seq("tmux", "select-layout", "-t", target, w.windowLayout)).!
   }
 }
