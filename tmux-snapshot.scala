@@ -184,52 +184,73 @@ def restore(): Unit = {
   }
 }
 
+/** -c に渡す作業ディレクトリを解決する。currentPath が存在すればそれを、
+ *  無ければ gitRoot（worktreeが消えてもリポジトリ本体が残っている場合）、
+ *  それも無ければ home を返す。ディレクトリが消えていてもウィンドウ作成自体は
+ *  必ず成功させ、特に最初のペインのパス消失でセッション全体の復元が巻き込まれるのを防ぐ。 */
+def resolveDir(pane: PaneState): String = {
+  def isDir(p: String): Boolean = {
+    try { Files.isDirectory(Paths.get(p)) }
+    catch { case _: Throwable => false }
+  }
+  if (isDir(pane.currentPath)) { pane.currentPath }
+  else { pane.gitRoot.filter(isDir).getOrElse(home) }
+}
+
 /** 1ウィンドウ分を復元する。複数ペインがあればsplit-windowで追加し、最後にレイアウトを適用する。
- *  claude が動いていたペインには claude -c を送り込んでセッションを再開する。 */
+ *  claude が動いていたペインには claude -c を送り込んでセッションを再開する。
+ *
+ *  ターゲット指定にはインデックス（session:window.pane）ではなく、tmuxの不変ID
+ *  （pane_id=%N, window_id=@N）を使う。インデックスは新規セッションで詰め直されるため
+ *  保存値とずれるが、不変IDは作成時に確定し以降変わらないため確実にターゲットできる。 */
 def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit = {
   val sortedPanes = w.panes.sortBy(_.paneIndex)
   val firstPane   = sortedPanes.head
 
-  // ウィンドウを作成し、実際に割り当てられたインデックスを取得する。
-  // ウィンドウ名が重複する場合でも正確にターゲットできるようインデックスで扱う。
-  val actualWindowIndex: Int = if (isFirstWindow) {
-    Process(Seq("tmux", "new-session", "-d", "-s", session, "-n", w.windowName, "-c", firstPane.currentPath)).!
-    runCapture(Seq("tmux", "display-message", "-p", "-t", session, "#{window_index}"))
-      .flatMap(_.trim.toIntOption)
-      .getOrElse(0)
+  // ウィンドウを作成し、その最初のペインの pane_id (%N) を取得する。
+  // new-session / new-window はいずれも -P -F で新規ペインのIDを出力できる。
+  val firstDir = resolveDir(firstPane)
+  val firstPaneId: Option[String] = if (isFirstWindow) {
+    runCapture(Seq("tmux", "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", session, "-n", w.windowName, "-c", firstDir))
+      .map(_.trim).filter(_.nonEmpty)
   } else {
-    runCapture(Seq("tmux", "new-window", "-P", "-F", "#{window_index}", "-t", session, "-n", w.windowName, "-c", firstPane.currentPath))
-      .flatMap(_.trim.toIntOption)
-      .getOrElse(w.windowIndex)
+    runCapture(Seq("tmux", "new-window", "-P", "-F", "#{pane_id}", "-t", session, "-n", w.windowName, "-c", firstDir))
+      .map(_.trim).filter(_.nonEmpty)
   }
 
-  val target = s"$session:$actualWindowIndex"
+  firstPaneId match {
+    case None => {
+      System.err.println(s"Failed to create window '${w.windowName}' in session '$session'; skipping.")
+    }
+    case Some(fpid) => {
+      // (pane_id, 保存済みペイン) のペアを追跡する
+      val paneMapping = scala.collection.mutable.ListBuffer((fpid, firstPane))
 
-  // 最初のペインの実際のインデックスを取得し、(実インデックス, 保存済みペイン) のペアを追跡する
-  val firstActualPaneIndex = runCapture(Seq("tmux", "display-message", "-p", "-t", target, "#{pane_index}"))
-    .flatMap(_.trim.toIntOption)
-    .getOrElse(0)
+      // 2ペイン目以降を split-window で追加する。-t に最初のペインのIDを指定すると
+      // 同じウィンドウ内に分割される。新ペインの pane_id を記録する。
+      sortedPanes.tail.foreach { pane =>
+        runCapture(Seq("tmux", "split-window", "-P", "-F", "#{pane_id}", "-t", fpid, "-c", resolveDir(pane)))
+          .map(_.trim).filter(_.nonEmpty) match {
+          case Some(pid) => paneMapping += ((pid, pane))
+          case None      => System.err.println(s"Failed to split pane in window '${w.windowName}'; skipping that pane.")
+        }
+      }
 
-  val paneMapping = scala.collection.mutable.ListBuffer((firstActualPaneIndex, firstPane))
+      // 複数ペインかつ保存済みレイアウトがある場合のみ適用する。
+      // レイアウトは window_id (@N) を対象にする（pane_id から引く）。
+      if (sortedPanes.size > 1 && w.windowLayout.nonEmpty) {
+        runCapture(Seq("tmux", "display-message", "-p", "-t", fpid, "#{window_id}"))
+          .map(_.trim).filter(_.nonEmpty)
+          .foreach(winId => Process(Seq("tmux", "select-layout", "-t", winId, w.windowLayout)).!)
+      }
 
-  // 2ペイン目以降を split-window で追加し、割り当てられたインデックスを記録する
-  sortedPanes.tail.foreach { pane =>
-    val newPaneIndex = runCapture(Seq("tmux", "split-window", "-P", "-F", "#{pane_index}", "-t", target, "-c", pane.currentPath))
-      .flatMap(_.trim.toIntOption)
-      .getOrElse(-1)
-    paneMapping += ((newPaneIndex, pane))
-  }
-
-  // 複数ペインがある場合は保存済みレイアウトを適用する
-  if (sortedPanes.size > 1) {
-    Process(Seq("tmux", "select-layout", "-t", target, w.windowLayout)).!
-  }
-
-  // claude が動いていたペインには claude -c を送り込み、
-  // そのディレクトリの直近の会話を再開する（-c はピッカーを開かず自動再開する）
-  paneMapping.foreach { case (actualPaneIndex, savedPane) =>
-    if (savedPane.runningCommand == "claude") {
-      Process(Seq("tmux", "send-keys", "-t", s"$target.$actualPaneIndex", "claude -c", "Enter")).!
+      // claude が動いていたペインには claude -c を送り込み、
+      // そのディレクトリの直近の会話を再開する（-c はピッカーを開かず自動再開する）
+      paneMapping.foreach { case (paneId, savedPane) =>
+        if (savedPane.runningCommand == "claude") {
+          Process(Seq("tmux", "send-keys", "-t", paneId, "claude -c", "Enter")).!
+        }
+      }
     }
   }
 }
