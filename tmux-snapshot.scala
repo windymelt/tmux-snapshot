@@ -170,11 +170,13 @@ def restore(): Unit = {
       snap.windows.groupBy(_.session).foreach { case (sessionName, windows) =>
         val exists = Process(Seq("tmux", "has-session", "-t", sessionName)).run(sink).exitValue() == 0
         val sorted = windows.sortBy(_.windowIndex)
-        if (!exists) {
+        if (exists) {
+          // 既存セッションには追加しない。誤って起動中のtmux上でrestoreした場合に
+          // ウィンドウが重複生成されるのを防ぐため、復元は「セッションが存在しない場合のみ」行う。
+          println(s"Session '$sessionName' already exists; skipping restore for it.")
+        } else {
           createWindow(sessionName, sorted.head, isFirstWindow = true)
           sorted.tail.foreach(w => createWindow(sessionName, w, isFirstWindow = false))
-        } else {
-          sorted.foreach(w => createWindow(sessionName, w, isFirstWindow = false))
         }
       }
       println("Done.")
