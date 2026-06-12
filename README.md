@@ -71,9 +71,23 @@ tmux-snapshot --state /tmp/test-state.json restore
 
 This is convenient for trying the tool out without touching the snapshot your timer maintains.
 
+### Working with a single session
+
+Pass `--session <name>` to operate on just one session:
+
+```sh
+tmux-snapshot --session work dump      # snapshot only the "work" session
+tmux-snapshot --session work restore   # restore only the "work" session
+```
+
+- `dump --session <name>` captures only that session and **merges** it into the snapshot: the entries for other sessions already in the file are preserved, and only the named session is replaced. It never clobbers the rest of the snapshot.
+- `restore --session <name>` restores only that session and touches no other. If the snapshot does not contain it, the command fails without changing anything.
+
+Without `--session`, both commands operate on every session, as described in the [Design contract](#design-contract).
+
 ## Design contract
 
-- **All sessions are saved.** `dump` captures every session on the tmux server (`tmux list-panes -a`).
+- **All sessions are saved by default.** `dump` captures every session on the tmux server (`tmux list-panes -a`). Scope it to one session with `--session <name>` (see [Working with a single session](#working-with-a-single-session)).
 - **`dump` never destroys a good snapshot.** If tmux is not running (e.g. just after a reboot, before you restore), `dump` does nothing and leaves the last good `state.json` intact.
 - **`restore` is decided per session by name.** For each saved session, if a session with that name already exists, `restore` warns and leaves it untouched; otherwise it is rebuilt. This makes `restore` safe to run more than once and from inside a live tmux session.
 - **Immutable IDs.** Windows and panes are targeted by tmux IDs captured at creation, never by index.

@@ -49,7 +49,14 @@ val defaultStateFile = Paths.get(home, ".local", "share", "tmux-snapshot", "stat
 /** stdoutもstderrも捨てるロガー。tmuxやgitのエラー出力を抑制するために使用する */
 val sink = ProcessLogger(_ => (), _ => ())
 
-val usage = "Usage: tmux-snapshot [--state <path>] [dump|restore]"
+val usage = "Usage: tmux-snapshot [--state <path>] [--session <name>] [dump|restore]"
+
+/** 解析済みのコマンドライン設定。session が Some の場合、dump/restore はそのセッションのみを対象にする */
+case class Config(
+  command: String,
+  stateFile: java.nio.file.Path,
+  session: Option[String]
+)
 
 object Main {
   def main(args: Array[String]): Unit = {
@@ -58,10 +65,10 @@ object Main {
         System.err.println(msg)
         sys.exit(1)
       }
-      case Right((cmd, stateFile)) => {
-        cmd match {
-          case "dump"    => dump(stateFile)
-          case "restore" => restore(stateFile)
+      case Right(cfg) => {
+        cfg.command match {
+          case "dump"    => dump(cfg.stateFile, cfg.session)
+          case "restore" => restore(cfg.stateFile, cfg.session)
           case _ => {
             System.err.println(usage)
             sys.exit(1)
@@ -72,28 +79,31 @@ object Main {
   }
 }
 
-/** 引数を解析し、(サブコマンド, 保存先パス) を返す。`--state <path>` と `--state=<path>` の
- *  両形式を受け付ける。--state 未指定時は defaultStateFile を用いる。 */
-def parseArgs(args: List[String]): Either[String, (String, java.nio.file.Path)] = {
-  def loop(rest: List[String], cmd: Option[String], state: Option[String]): Either[String, (String, java.nio.file.Path)] = {
+/** 引数を解析して Config を返す。`--state <path>` `--session <name>` をそれぞれ
+ *  スペース区切り・`=`区切りの両形式で受け付ける。未指定時は state=defaultStateFile, session=None。 */
+def parseArgs(args: List[String]): Either[String, Config] = {
+  def loop(rest: List[String], cmd: Option[String], state: Option[String], session: Option[String]): Either[String, Config] = {
     rest match {
       case Nil => {
         cmd match {
-          case Some(c) => Right((c, state.map(Paths.get(_)).getOrElse(defaultStateFile)))
+          case Some(c) => Right(Config(c, state.map(Paths.get(_)).getOrElse(defaultStateFile), session))
           case None    => Left(usage)
         }
       }
-      case "--state" :: value :: tail => loop(tail, cmd, Some(value))
+      case "--state" :: value :: tail => loop(tail, cmd, Some(value), session)
       case "--state" :: Nil           => Left("--state requires a path argument")
-      case arg :: tail if arg.startsWith("--state=") => loop(tail, cmd, Some(arg.drop("--state=".length)))
-      case arg :: _ if arg.startsWith("-")           => Left(s"Unknown option: $arg")
+      case arg :: tail if arg.startsWith("--state=")   => loop(tail, cmd, Some(arg.drop("--state=".length)), session)
+      case "--session" :: value :: tail => loop(tail, cmd, state, Some(value))
+      case "--session" :: Nil           => Left("--session requires a name argument")
+      case arg :: tail if arg.startsWith("--session=") => loop(tail, cmd, state, Some(arg.drop("--session=".length)))
+      case arg :: _ if arg.startsWith("-")             => Left(s"Unknown option: $arg")
       case arg :: tail => {
         if (cmd.isDefined) { Left(s"Unexpected argument: $arg") }
-        else { loop(tail, Some(arg), state) }
+        else { loop(tail, Some(arg), state, session) }
       }
     }
   }
-  loop(args, None, None)
+  loop(args, None, None, None)
 }
 
 def isTmuxRunning: Boolean = {
@@ -106,19 +116,43 @@ def runCapture(cmd: Seq[String]): Option[String] = {
   catch { case _: Throwable => None }
 }
 
-def dump(stateFile: java.nio.file.Path): Unit = {
+/** スナップショットを読み込む。ファイルが無い、または壊れている場合は None を返す */
+def readSnapshot(stateFile: java.nio.file.Path): Option[Snapshot] = {
+  if (!Files.exists(stateFile)) { None }
+  else {
+    val json = new String(Files.readAllBytes(stateFile), StandardCharsets.UTF_8)
+    decode[Snapshot](json).toOption
+  }
+}
+
+/** tmux の状態を取得して stateFile に保存する。
+ *  session が Some の場合はそのセッションのみを対象とし、既存スナップショット中の
+ *  他セッションは保持したまま当該セッションのみを差し替える（マージ）。これにより
+ *  特定セッションだけを更新しても他の復元材料を壊さない。 */
+def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   if (!isTmuxRunning) { return }
 
   // ペイン単位で session/window/layout/pane/command 情報をまとめて取得する
-  val format = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}"
-  runCapture(Seq("tmux", "list-panes", "-a", "-F", format)) match {
+  val format  = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}"
+  val listCmd = session match {
+    // 末尾コロン "name:" でセッションを明示する。数値セッション名（"0","1"等）は
+    // "-t 1" だとウィンドウインデックス1と解釈され誤ターゲットになるため。
+    case Some(s) => Seq("tmux", "list-panes", "-s", "-t", s + ":", "-F", format)
+    case None    => Seq("tmux", "list-panes", "-a", "-F", format)
+  }
+  runCapture(listCmd) match {
     case None => return
     case Some(raw) => {
-      val windows  = buildWindows(raw.trim.linesIterator.toList)
+      val captured = buildWindows(raw.trim.linesIterator.toList)
+      // --session 指定時は他セッションを保持してマージする。未指定時は全置換。
+      val windows = session match {
+        case Some(s) => readSnapshot(stateFile).map(_.windows).getOrElse(Nil).filterNot(_.session == s) ++ captured
+        case None    => captured
+      }
       val snapshot = Snapshot(version = 0, savedAt = java.time.Instant.now().toString, windows = windows)
       Option(stateFile.getParent).foreach(Files.createDirectories(_))
       Files.write(stateFile, snapshot.asJson.spaces2.getBytes(StandardCharsets.UTF_8))
-      println(s"Saved ${windows.size} window(s), ${windows.map(_.panes.size).sum} pane(s) → $stateFile")
+      println(s"Saved ${captured.size} window(s), ${captured.map(_.panes.size).sum} pane(s) → $stateFile")
     }
   }
 }
@@ -187,7 +221,7 @@ def gitInfo(path: String): (Option[String], Option[String], Boolean) = {
   (root, branch, isWorktree)
 }
 
-def restore(stateFile: java.nio.file.Path): Unit = {
+def restore(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   if (!Files.exists(stateFile)) {
     System.err.println(s"Snapshot not found: $stateFile")
     sys.exit(1)
@@ -200,8 +234,19 @@ def restore(stateFile: java.nio.file.Path): Unit = {
       sys.exit(1)
     }
     case Right(snap) => {
+      // --session 指定時は当該セッションのみに絞り込む。該当が無ければエラーで終了する。
+      val targetWindows = session match {
+        case Some(s) => snap.windows.filter(_.session == s)
+        case None    => snap.windows
+      }
+      session.foreach { s =>
+        if (targetWindows.isEmpty) {
+          System.err.println(s"Session '$s' not found in snapshot: $stateFile")
+          sys.exit(1)
+        }
+      }
       println(s"Restoring from ${snap.savedAt}")
-      snap.windows.groupBy(_.session).foreach { case (sessionName, windows) =>
+      targetWindows.groupBy(_.session).foreach { case (sessionName, windows) =>
         val exists = Process(Seq("tmux", "has-session", "-t", sessionName)).run(sink).exitValue() == 0
         val sorted = windows.sortBy(_.windowIndex)
         if (exists) {
@@ -248,7 +293,9 @@ def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit 
     runCapture(Seq("tmux", "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", session, "-n", w.windowName, "-c", firstDir))
       .map(_.trim).filter(_.nonEmpty)
   } else {
-    runCapture(Seq("tmux", "new-window", "-P", "-F", "#{pane_id}", "-t", session, "-n", w.windowName, "-c", firstDir))
+    // 末尾コロン "session:" でセッションを明示する。数値セッション名では "-t 1" が
+    // ウィンドウインデックス1と解釈され、別セッションに誤ってウィンドウを作ってしまうため。
+    runCapture(Seq("tmux", "new-window", "-P", "-F", "#{pane_id}", "-t", session + ":", "-n", w.windowName, "-c", firstDir))
       .map(_.trim).filter(_.nonEmpty)
   }
 
