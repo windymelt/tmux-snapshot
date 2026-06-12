@@ -4,6 +4,7 @@
 //> using dep io.circe::circe-generic::0.14.15
 //> using dep io.circe::circe-parser::0.14.15
 //> using dep io.github.cquiroz::scala-java-time::2.6.0
+//> using dep com.github.scopt::scopt::4.1.0
 //> using nativeMode release-fast
 //> using nativeLto thin
 //> using mainClass Main
@@ -15,6 +16,7 @@ import io.circe.syntax.*
 import scala.sys.process.*
 import java.nio.file.{Files, Paths}
 import java.nio.charset.StandardCharsets
+import scopt.OParser
 
 /** ペイン単位の状態。runningCommand はdump時点でフォアグラウンドで動いていたコマンド名 */
 case class PaneState(
@@ -49,61 +51,47 @@ val defaultStateFile = Paths.get(home, ".local", "share", "tmux-snapshot", "stat
 /** stdoutもstderrも捨てるロガー。tmuxやgitのエラー出力を抑制するために使用する */
 val sink = ProcessLogger(_ => (), _ => ())
 
-val usage = "Usage: tmux-snapshot [--state <path>] [--session <name>] [dump|restore]"
-
 /** 解析済みのコマンドライン設定。session が Some の場合、dump/restore はそのセッションのみを対象にする */
 case class Config(
-  command: String,
-  stateFile: java.nio.file.Path,
-  session: Option[String]
+  command: String = "",
+  stateFile: java.nio.file.Path = defaultStateFile,
+  session: Option[String] = None
 )
+
+val cliParser = {
+  val builder = OParser.builder[Config]
+  import builder.*
+  OParser.sequence(
+    programName("tmux-snapshot"),
+    opt[String]("state")
+      .valueName("<path>")
+      .action((x, c) => c.copy(stateFile = Paths.get(x)))
+      .text("スナップショット保存先"),
+    opt[String]("session")
+      .valueName("<name>")
+      .action((x, c) => c.copy(session = Some(x)))
+      .text("対象セッション名"),
+    arg[String]("<command>")
+      .action((x, c) => c.copy(command = x))
+      .validate(x =>
+        if (x == "dump" || x == "restore") success
+        else failure(s"コマンドは dump または restore を指定してください: $x")
+      )
+      .text("実行するコマンド (dump または restore)")
+  )
+}
 
 object Main {
   def main(args: Array[String]): Unit = {
-    parseArgs(args.toList) match {
-      case Left(msg) => {
-        System.err.println(msg)
-        sys.exit(1)
-      }
-      case Right(cfg) => {
+    OParser.parse(cliParser, args, Config()) match {
+      case Some(cfg) =>
         cfg.command match {
           case "dump"    => dump(cfg.stateFile, cfg.session)
           case "restore" => restore(cfg.stateFile, cfg.session)
-          case _ => {
-            System.err.println(usage)
-            sys.exit(1)
-          }
         }
-      }
+      case None => sys.exit(1)
     }
   }
-}
-
-/** 引数を解析して Config を返す。`--state <path>` `--session <name>` をそれぞれ
- *  スペース区切り・`=`区切りの両形式で受け付ける。未指定時は state=defaultStateFile, session=None。 */
-def parseArgs(args: List[String]): Either[String, Config] = {
-  def loop(rest: List[String], cmd: Option[String], state: Option[String], session: Option[String]): Either[String, Config] = {
-    rest match {
-      case Nil => {
-        cmd match {
-          case Some(c) => Right(Config(c, state.map(Paths.get(_)).getOrElse(defaultStateFile), session))
-          case None    => Left(usage)
-        }
-      }
-      case "--state" :: value :: tail => loop(tail, cmd, Some(value), session)
-      case "--state" :: Nil           => Left("--state requires a path argument")
-      case arg :: tail if arg.startsWith("--state=")   => loop(tail, cmd, Some(arg.drop("--state=".length)), session)
-      case "--session" :: value :: tail => loop(tail, cmd, state, Some(value))
-      case "--session" :: Nil           => Left("--session requires a name argument")
-      case arg :: tail if arg.startsWith("--session=") => loop(tail, cmd, state, Some(arg.drop("--session=".length)))
-      case arg :: _ if arg.startsWith("-")             => Left(s"Unknown option: $arg")
-      case arg :: tail => {
-        if (cmd.isDefined) { Left(s"Unexpected argument: $arg") }
-        else { loop(tail, Some(arg), state, session) }
-      }
-    }
-  }
-  loop(args, None, None, None)
 }
 
 def isTmuxRunning: Boolean = {
