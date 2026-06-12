@@ -60,6 +60,17 @@ tmux attach            # or: tmux attach -t <session-name>
 
 `restore` recreates each saved session (as a detached session) and resumes each Claude conversation. You can also run `dump` / `restore` manually at any time.
 
+### Choosing the snapshot file
+
+By default the snapshot is read from and written to `~/.local/share/tmux-snapshot/state.json`. Pass `--state <path>` to use a different file:
+
+```sh
+tmux-snapshot --state /tmp/test-state.json dump
+tmux-snapshot --state /tmp/test-state.json restore
+```
+
+This is convenient for trying the tool out without touching the snapshot your timer maintains.
+
 ## Design contract
 
 - **All sessions are saved.** `dump` captures every session on the tmux server (`tmux list-panes -a`).

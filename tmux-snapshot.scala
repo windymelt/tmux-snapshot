@@ -42,24 +42,58 @@ case class Snapshot(
   windows: List[WindowState]
 ) derives Codec.AsObject
 
-val home      = sys.env.getOrElse("HOME", System.getProperty("user.home"))
-val stateDir  = Paths.get(home, ".local", "share", "tmux-snapshot")
-val stateFile = stateDir.resolve("state.json")
+val home             = sys.env.getOrElse("HOME", System.getProperty("user.home"))
+// --state 未指定時のデフォルト保存先
+val defaultStateFile = Paths.get(home, ".local", "share", "tmux-snapshot", "state.json")
 
 /** stdoutもstderrも捨てるロガー。tmuxやgitのエラー出力を抑制するために使用する */
 val sink = ProcessLogger(_ => (), _ => ())
 
+val usage = "Usage: tmux-snapshot [--state <path>] [dump|restore]"
+
 object Main {
   def main(args: Array[String]): Unit = {
-    args.headOption match {
-      case Some("dump")    => dump()
-      case Some("restore") => restore()
-      case _ => {
-        System.err.println("Usage: tmux-snapshot [dump|restore]")
+    parseArgs(args.toList) match {
+      case Left(msg) => {
+        System.err.println(msg)
         sys.exit(1)
+      }
+      case Right((cmd, stateFile)) => {
+        cmd match {
+          case "dump"    => dump(stateFile)
+          case "restore" => restore(stateFile)
+          case _ => {
+            System.err.println(usage)
+            sys.exit(1)
+          }
+        }
       }
     }
   }
+}
+
+/** 引数を解析し、(サブコマンド, 保存先パス) を返す。`--state <path>` と `--state=<path>` の
+ *  両形式を受け付ける。--state 未指定時は defaultStateFile を用いる。 */
+def parseArgs(args: List[String]): Either[String, (String, java.nio.file.Path)] = {
+  def loop(rest: List[String], cmd: Option[String], state: Option[String]): Either[String, (String, java.nio.file.Path)] = {
+    rest match {
+      case Nil => {
+        cmd match {
+          case Some(c) => Right((c, state.map(Paths.get(_)).getOrElse(defaultStateFile)))
+          case None    => Left(usage)
+        }
+      }
+      case "--state" :: value :: tail => loop(tail, cmd, Some(value))
+      case "--state" :: Nil           => Left("--state requires a path argument")
+      case arg :: tail if arg.startsWith("--state=") => loop(tail, cmd, Some(arg.drop("--state=".length)))
+      case arg :: _ if arg.startsWith("-")           => Left(s"Unknown option: $arg")
+      case arg :: tail => {
+        if (cmd.isDefined) { Left(s"Unexpected argument: $arg") }
+        else { loop(tail, Some(arg), state) }
+      }
+    }
+  }
+  loop(args, None, None)
 }
 
 def isTmuxRunning: Boolean = {
@@ -72,7 +106,7 @@ def runCapture(cmd: Seq[String]): Option[String] = {
   catch { case _: Throwable => None }
 }
 
-def dump(): Unit = {
+def dump(stateFile: java.nio.file.Path): Unit = {
   if (!isTmuxRunning) { return }
 
   // ペイン単位で session/window/layout/pane/command 情報をまとめて取得する
@@ -82,7 +116,7 @@ def dump(): Unit = {
     case Some(raw) => {
       val windows  = buildWindows(raw.trim.linesIterator.toList)
       val snapshot = Snapshot(version = 0, savedAt = java.time.Instant.now().toString, windows = windows)
-      Files.createDirectories(stateDir)
+      Option(stateFile.getParent).foreach(Files.createDirectories(_))
       Files.write(stateFile, snapshot.asJson.spaces2.getBytes(StandardCharsets.UTF_8))
       println(s"Saved ${windows.size} window(s), ${windows.map(_.panes.size).sum} pane(s) → $stateFile")
     }
@@ -153,7 +187,7 @@ def gitInfo(path: String): (Option[String], Option[String], Boolean) = {
   (root, branch, isWorktree)
 }
 
-def restore(): Unit = {
+def restore(stateFile: java.nio.file.Path): Unit = {
   if (!Files.exists(stateFile)) {
     System.err.println(s"Snapshot not found: $stateFile")
     sys.exit(1)
