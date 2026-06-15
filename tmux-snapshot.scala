@@ -1,5 +1,7 @@
 //> using platform scala-native
-//> using scala 3.3.3
+//> using scala 3.3.8
+//> using nativeVersion "0.5.12"
+//> using options -Yfuture-lazy-vals -java-output-version:11
 //> using dep io.circe::circe-core::0.14.15
 //> using dep io.circe::circe-generic::0.14.15
 //> using dep io.circe::circe-parser::0.14.15
