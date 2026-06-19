@@ -20,7 +20,7 @@ import java.nio.file.{Files, Paths}
 import java.nio.charset.StandardCharsets
 import scopt.OParser
 
-/** ペイン単位の状態。runningCommand はdump時点でフォアグラウンドで動いていたコマンド名 */
+/** Per-pane state. runningCommand is the foreground command name at dump time. */
 case class PaneState(
   paneIndex: Int,
   currentPath: String,
@@ -30,7 +30,7 @@ case class PaneState(
   isWorktree: Boolean
 ) derives Codec.AsObject
 
-/** ウィンドウ単位の状態。windowLayout はtmuxのレイアウト文字列 */
+/** Per-window state. windowLayout is the tmux layout string. */
 case class WindowState(
   session: String,
   windowIndex: Int,
@@ -39,7 +39,7 @@ case class WindowState(
   panes: List[PaneState]
 ) derives Codec.AsObject
 
-/** 保存時刻と全ウィンドウ状態のスナップショット */
+/** Snapshot of save time and all window states. */
 case class Snapshot(
   version: Int,
   savedAt: String,
@@ -47,13 +47,13 @@ case class Snapshot(
 ) derives Codec.AsObject
 
 val home             = sys.env.getOrElse("HOME", System.getProperty("user.home"))
-// --state 未指定時のデフォルト保存先
+// Default save location when --state is not specified
 val defaultStateFile = Paths.get(home, ".local", "share", "tmux-snapshot", "state.json")
 
-/** stdoutもstderrも捨てるロガー。tmuxやgitのエラー出力を抑制するために使用する */
+/** Logger that discards both stdout and stderr. Used to suppress error output from tmux and git. */
 val sink = ProcessLogger(_ => (), _ => ())
 
-/** 解析済みのコマンドライン設定。session が Some の場合、dump/restore はそのセッションのみを対象にする */
+/** Parsed command-line config. When session is Some, dump/restore targets only that session. */
 case class Config(
   command: String = "",
   stateFile: java.nio.file.Path = defaultStateFile,
@@ -68,18 +68,18 @@ val cliParser = {
     opt[String]("state")
       .valueName("<path>")
       .action((x, c) => c.copy(stateFile = Paths.get(x)))
-      .text("スナップショット保存先"),
+      .text("path to snapshot file"),
     opt[String]("session")
       .valueName("<name>")
       .action((x, c) => c.copy(session = Some(x)))
-      .text("対象セッション名"),
+      .text("target session name"),
     arg[String]("<command>")
       .action((x, c) => c.copy(command = x))
       .validate(x =>
         if (x == "dump" || x == "restore") success
-        else failure(s"コマンドは dump または restore を指定してください: $x")
+        else failure(s"command must be dump or restore: $x")
       )
-      .text("実行するコマンド (dump または restore)")
+      .text("command to run (dump or restore)")
   )
 }
 
@@ -100,13 +100,13 @@ def isTmuxRunning: Boolean = {
   Process(Seq("tmux", "list-sessions")).run(sink).exitValue() == 0
 }
 
-/** コマンドを実行してstdoutを返す。終了コードが非ゼロの場合はNoneを返す */
+/** Runs a command and returns its stdout. Returns None if the exit code is non-zero. */
 def runCapture(cmd: Seq[String]): Option[String] = {
   try { Some(Process(cmd).!!(sink)) }
   catch { case _: Throwable => None }
 }
 
-/** スナップショットを読み込む。ファイルが無い、または壊れている場合は None を返す */
+/** Reads the snapshot file. Returns None if the file does not exist or is malformed. */
 def readSnapshot(stateFile: java.nio.file.Path): Option[Snapshot] = {
   if (!Files.exists(stateFile)) { None }
   else {
@@ -115,18 +115,18 @@ def readSnapshot(stateFile: java.nio.file.Path): Option[Snapshot] = {
   }
 }
 
-/** tmux の状態を取得して stateFile に保存する。
- *  session が Some の場合はそのセッションのみを対象とし、既存スナップショット中の
- *  他セッションは保持したまま当該セッションのみを差し替える（マージ）。これにより
- *  特定セッションだけを更新しても他の復元材料を壊さない。 */
+/** Captures tmux state and writes it to stateFile.
+ *  When session is Some, only that session is targeted and merged into the snapshot:
+ *  other sessions already in the file are preserved, preventing a single-session update
+ *  from clobbering the rest of the snapshot. */
 def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   if (!isTmuxRunning) { return }
 
-  // ペイン単位で session/window/layout/pane/command 情報をまとめて取得する
+  // Fetch session/window/layout/pane/command info per pane in one call
   val format  = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}"
   val listCmd = session match {
-    // 末尾コロン "name:" でセッションを明示する。数値セッション名（"0","1"等）は
-    // "-t 1" だとウィンドウインデックス1と解釈され誤ターゲットになるため。
+    // Append ":" to the session name to disambiguate. Numeric session names like "0" or "1"
+    // would be interpreted as window indexes by tmux without the trailing colon.
     case Some(s) => Seq("tmux", "list-panes", "-s", "-t", s + ":", "-F", format)
     case None    => Seq("tmux", "list-panes", "-a", "-F", format)
   }
@@ -134,7 +134,7 @@ def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
     case None => return
     case Some(raw) => {
       val captured = buildWindows(raw.trim.linesIterator.toList)
-      // --session 指定時は他セッションを保持してマージする。未指定時は全置換。
+      // With --session: merge into existing snapshot; without: replace all windows.
       val windows = session match {
         case Some(s) => readSnapshot(stateFile).map(_.windows).getOrElse(Nil).filterNot(_.session == s) ++ captured
         case None    => captured
@@ -147,7 +147,7 @@ def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   }
 }
 
-/** タブ区切り行のリストをWindowStateのリストに変換する。ウィンドウ出現順を保持する */
+/** Converts a list of tab-separated lines into a list of WindowState, preserving window order. */
 def buildWindows(lines: List[String]): List[WindowState] = {
   case class RawPane(
     session: String,
@@ -170,7 +170,7 @@ def buildWindows(lines: List[String]): List[WindowState] = {
     }
   }
 
-  // LinkedHashMap で (session, windowIndex) をキーに出現順を保持しながらグループ化する
+  // Group by (session, windowIndex) using LinkedHashMap to preserve insertion order
   val grouped = scala.collection.mutable.LinkedHashMap.empty[(String, Int), List[RawPane]]
   rawPanes.foreach { rp =>
     val key = (rp.session, rp.windowIndex)
@@ -189,7 +189,7 @@ def buildWindows(lines: List[String]): List[WindowState] = {
   }
 }
 
-/** pathがgitリポジトリ内であれば、リポジトリルート・ブランチ・worktreeかどうかを返す */
+/** Returns the git root, current branch, and whether path is in a worktree, or None values if not a git repo. */
 def gitInfo(path: String): (Option[String], Option[String], Boolean) = {
   val root      = runCapture(Seq("git", "-C", path, "rev-parse", "--show-toplevel")).map(_.trim)
   val branch    = runCapture(Seq("git", "-C", path, "branch", "--show-current")).map(_.trim).filter(_.nonEmpty)
@@ -197,9 +197,9 @@ def gitInfo(path: String): (Option[String], Option[String], Boolean) = {
 
   val isWorktree = (root, commonDir) match {
     case (Some(r), Some(cd)) => {
-      // --git-common-dir は相対パス（".git" など）を返す場合があるため path 基準で解決する。
-      // メインworktreeでは commonDir の親 == show-toplevel が成立し、
-      // 追加worktreeでは両者が異なる。
+      // --git-common-dir may return a relative path (e.g. ".git"), so resolve it against path.
+      // In the main worktree, the parent of commonDir equals show-toplevel;
+      // in a linked worktree they differ.
       val resolvedCommon = Paths.get(path).resolve(cd).normalize()
       val mainRoot       = resolvedCommon.getParent
       try { Paths.get(r).toRealPath() != mainRoot.toRealPath() }
@@ -224,7 +224,7 @@ def restore(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
       sys.exit(1)
     }
     case Right(snap) => {
-      // --session 指定時は当該セッションのみに絞り込む。該当が無ければエラーで終了する。
+      // When --session is given, restrict to that session and exit with an error if not found.
       val targetWindows = session match {
         case Some(s) => snap.windows.filter(_.session == s)
         case None    => snap.windows
@@ -240,8 +240,8 @@ def restore(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
         val exists = Process(Seq("tmux", "has-session", "-t", sessionName)).run(sink).exitValue() == 0
         val sorted = windows.sortBy(_.windowIndex)
         if (exists) {
-          // 既存セッションには追加しない。誤って起動中のtmux上でrestoreした場合に
-          // ウィンドウが重複生成されるのを防ぐため、復元は「セッションが存在しない場合のみ」行う。
+          // Skip existing sessions to prevent duplicate windows when restore is run
+          // inside a live tmux session.
           println(s"Session '$sessionName' already exists; skipping restore for it.")
         } else {
           createWindow(sessionName, sorted.head, isFirstWindow = true)
@@ -253,10 +253,10 @@ def restore(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   }
 }
 
-/** -c に渡す作業ディレクトリを解決する。currentPath が存在すればそれを、
- *  無ければ gitRoot（worktreeが消えてもリポジトリ本体が残っている場合）、
- *  それも無ければ home を返す。ディレクトリが消えていてもウィンドウ作成自体は
- *  必ず成功させ、特に最初のペインのパス消失でセッション全体の復元が巻き込まれるのを防ぐ。 */
+/** Resolves the working directory for a pane. Returns currentPath if it exists,
+ *  falls back to gitRoot (useful when a worktree is gone but the repo remains),
+ *  then to home. Always returns a valid directory so window creation never fails
+ *  due to a missing path, even for the first pane of a session. */
 def resolveDir(pane: PaneState): String = {
   def isDir(p: String): Boolean = {
     try { Files.isDirectory(Paths.get(p)) }
@@ -266,25 +266,25 @@ def resolveDir(pane: PaneState): String = {
   else { pane.gitRoot.filter(isDir).getOrElse(home) }
 }
 
-/** 1ウィンドウ分を復元する。複数ペインがあればsplit-windowで追加し、最後にレイアウトを適用する。
- *  claude が動いていたペインには claude -c を送り込んでセッションを再開する。
+/** Restores one window. Additional panes are added with split-window and the saved layout
+ *  is applied at the end. Panes that were running claude receive "claude -c" to resume
+ *  the conversation.
  *
- *  ターゲット指定にはインデックス（session:window.pane）ではなく、tmuxの不変ID
- *  （pane_id=%N, window_id=@N）を使う。インデックスは新規セッションで詰め直されるため
- *  保存値とずれるが、不変IDは作成時に確定し以降変わらないため確実にターゲットできる。 */
+ *  Pane and window targets use tmux's immutable IDs (pane_id=%N, window_id=@N) rather than
+ *  indexes (session:window.pane). Indexes are renumbered on session creation and diverge from
+ *  saved values; immutable IDs are fixed at creation and always point to the right target. */
 def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit = {
   val sortedPanes = w.panes.sortBy(_.paneIndex)
   val firstPane   = sortedPanes.head
 
-  // ウィンドウを作成し、その最初のペインの pane_id (%N) を取得する。
-  // new-session / new-window はいずれも -P -F で新規ペインのIDを出力できる。
+  // Create the window and capture the first pane's pane_id (%N).
+  // Both new-session and new-window support -P -F to print the new pane's ID.
   val firstDir = resolveDir(firstPane)
   val firstPaneId: Option[String] = if (isFirstWindow) {
     runCapture(Seq("tmux", "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", session, "-n", w.windowName, "-c", firstDir))
       .map(_.trim).filter(_.nonEmpty)
   } else {
-    // 末尾コロン "session:" でセッションを明示する。数値セッション名では "-t 1" が
-    // ウィンドウインデックス1と解釈され、別セッションに誤ってウィンドウを作ってしまうため。
+    // Append ":" to the session name to disambiguate numeric session names from window indexes.
     runCapture(Seq("tmux", "new-window", "-P", "-F", "#{pane_id}", "-t", session + ":", "-n", w.windowName, "-c", firstDir))
       .map(_.trim).filter(_.nonEmpty)
   }
@@ -294,11 +294,11 @@ def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit 
       System.err.println(s"Failed to create window '${w.windowName}' in session '$session'; skipping.")
     }
     case Some(fpid) => {
-      // (pane_id, 保存済みペイン) のペアを追跡する
+      // Track (pane_id, saved pane) pairs
       val paneMapping = scala.collection.mutable.ListBuffer((fpid, firstPane))
 
-      // 2ペイン目以降を split-window で追加する。-t に最初のペインのIDを指定すると
-      // 同じウィンドウ内に分割される。新ペインの pane_id を記録する。
+      // Add subsequent panes with split-window, targeting the first pane ID to stay in the same window.
+      // Record each new pane's pane_id.
       sortedPanes.tail.foreach { pane =>
         runCapture(Seq("tmux", "split-window", "-P", "-F", "#{pane_id}", "-t", fpid, "-c", resolveDir(pane)))
           .map(_.trim).filter(_.nonEmpty) match {
@@ -307,16 +307,16 @@ def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit 
         }
       }
 
-      // 複数ペインかつ保存済みレイアウトがある場合のみ適用する。
-      // レイアウトは window_id (@N) を対象にする（pane_id から引く）。
+      // Apply the saved layout only for multi-pane windows.
+      // Layout target is window_id (@N), looked up from the first pane_id.
       if (sortedPanes.size > 1 && w.windowLayout.nonEmpty) {
         runCapture(Seq("tmux", "display-message", "-p", "-t", fpid, "#{window_id}"))
           .map(_.trim).filter(_.nonEmpty)
           .foreach(winId => Process(Seq("tmux", "select-layout", "-t", winId, w.windowLayout)).!)
       }
 
-      // claude が動いていたペインには claude -c を送り込み、
-      // そのディレクトリの直近の会話を再開する（-c はピッカーを開かず自動再開する）
+      // Send "claude -c" to panes that were running claude to resume the most recent
+      // conversation in that directory (-c skips the picker).
       paneMapping.foreach { case (paneId, savedPane) =>
         if (savedPane.runningCommand == "claude") {
           Process(Seq("tmux", "send-keys", "-t", paneId, "claude -c", "Enter")).!
