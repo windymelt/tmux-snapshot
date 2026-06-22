@@ -5,23 +5,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build and run
 
 ```sh
-# Type-check and compile without linking
-scala-cli compile tmux-snapshot.scala
+# Type-check and compile
+sbt compile
 
-# Run directly (development / ad-hoc testing)
-scala-cli run tmux-snapshot.scala -- dump
-scala-cli run tmux-snapshot.scala -- --state /tmp/test-state.json dump
-scala-cli run tmux-snapshot.scala -- --session work restore
+# Build a native binary
+sbt nativeLink
 
-# Build an installable native binary
-scala-cli package --native tmux-snapshot.scala -o ~/.local/bin/tmux-snapshot
+# Install the binary
+cp target/scala-3.3.8/tmux-snapshot-out ~/.local/bin/tmux-snapshot
 ```
 
 The first build compiles and links LLVM-generated native code and takes a few minutes; subsequent builds are incremental and fast.
 
 ## Architecture
 
-All logic lives in a single file, `tmux-snapshot.scala`. Dependencies and build settings are declared via `//> using` directives at the top of that file — there is no `build.sbt` or `build.mill`.
+All logic lives in a single file, `src/main/scala/tmux-snapshot.scala`. Build settings are declared in `build.sbt` using [sbt-scala-native](https://scala-native.org/en/stable/user/sbt.html).
 
 ### Data flow
 

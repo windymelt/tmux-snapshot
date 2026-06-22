@@ -1,17 +1,3 @@
-//> using platform scala-native
-//> using scala 3.3.8
-//> using nativeVersion "0.5.12"
-//> using options -Yfuture-lazy-vals -java-output-version:11
-//> using dep io.circe::circe-core::0.14.15
-//> using dep io.circe::circe-generic::0.14.15
-//> using dep io.circe::circe-parser::0.14.15
-//> using dep io.github.cquiroz::scala-java-time::2.6.0
-//> using dep com.github.scopt::scopt::4.1.0
-//> using nativeMode release-fast
-//> using nativeLto thin
-//> using mainClass Main
-//> using scalacOptions -no-indent
-
 import io.circe.Codec
 import io.circe.parser.decode
 import io.circe.syntax.*
