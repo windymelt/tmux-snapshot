@@ -9,11 +9,7 @@ scalaVersion := "3.3.8"
 
 Compile / mainClass := Some("Main")
 
-scalacOptions ++= Seq(
-  "-Yfuture-lazy-vals",
-  "-java-output-version:11",
-  "-no-indent"
-)
+scalacOptions += "-no-indent"
 
 libraryDependencies ++= Seq(
   "io.circe"           %% "circe-core"      % "0.14.15",
@@ -23,7 +19,10 @@ libraryDependencies ++= Seq(
   "com.github.scopt"   %% "scopt"           % "4.1.0"
 )
 
-nativeConfig ~= {
+val nativeCfg: NativeConfig => NativeConfig =
   _.withMode(Mode.releaseFast)
    .withLTO(LTO.thin)
-}
+
+nativeConfig ~= nativeCfg
+
+Test / nativeConfig ~= nativeCfg
