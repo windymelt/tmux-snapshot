@@ -4,3 +4,6 @@
 .idea/
 *.swp
 .DS_Store
+target/
+project/target/
+project/project/
