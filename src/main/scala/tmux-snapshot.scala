@@ -5,6 +5,9 @@ import scala.sys.process.*
 import java.nio.file.{Files, Paths}
 import java.nio.charset.StandardCharsets
 import scopt.OParser
+import scala.scalanative.unsafe.*
+import scala.scalanative.posix.unistd
+import cue4s.*
 
 /** Per-pane state. runningCommand is the foreground command name at dump time. */
 case class PaneState(
@@ -71,6 +74,9 @@ val cliParser = {
 
 object Main {
   def main(args: Array[String]): Unit = {
+    // Intercept the `tmux` passthrough subcommand before scopt parsing so it never
+    // reaches the dump/restore parser, which would reject unknown arguments.
+    if (args.headOption.contains("tmux")) { launchTmux(args.tail.toSeq); return }
     OParser.parse(cliParser, args, Config()) match {
       case Some(cfg) =>
         cfg.command match {
@@ -84,6 +90,54 @@ object Main {
 
 def isTmuxRunning: Boolean = {
   Process(Seq("tmux", "list-sessions")).run(sink).exitValue() == 0
+}
+
+/** Implements the `tmux` passthrough subcommand (intended for `alias tmux='tmux-snapshot tmux'`).
+ *
+ *  1. tmux server already running          → pass through, no restore decision.
+ *  2. no server, no usable snapshot         → pass through.
+ *  3. no server, snapshot exists, non-TTY   → pass through (never prompt; default is No).
+ *  4. no server, snapshot exists, TTY       → confirm; Yes restores then attaches, No passes through.
+ *
+ *  The confirmation defaults to No so an accidental Enter does not trigger a restore.
+ *  restore is idempotent (has-session guard), so an unwanted restore is non-destructive anyway. */
+def launchTmux(passthrough: Seq[String]): Unit = {
+  if (isTmuxRunning) { execTmux(passthrough); return }
+  readSnapshot(defaultStateFile) match {
+    case None => execTmux(passthrough)
+    case Some(_) =>
+      if (unistd.isatty(unistd.STDIN_FILENO) != 1) {
+        execTmux(passthrough)
+      } else {
+        // The prompt must complete and restore the terminal (SyncPromptsBuilder.use closes it in
+        // a finally block) before exec. Running exec inside the use block would leave tmux to
+        // inherit a raw terminal and misbehave on attach.
+        val yes = new SyncPromptsBuilder()
+          .use(_.confirm("No tmux server running. Restore the saved snapshot?", default = false))
+          .toOption
+          .getOrElse(false)
+        if (yes) { restore(defaultStateFile, None); execTmux(Seq("attach")) }
+        else { execTmux(passthrough) }
+      }
+  }
+}
+
+/** Replaces the current process with tmux via execvp, passing args after the program name.
+ *  execvp performs a PATH lookup, so a shell alias that points back here does not recurse.
+ *  Returns only on failure; on success the process image is replaced and control never comes back. */
+def execTmux(args: Seq[String]): Unit = {
+  // execvp replaces the process image and discards buffered output, so flush first.
+  System.out.flush()
+  System.err.flush()
+  Zone.acquire { implicit z =>
+    val argv = alloc[CString](args.size + 2)
+    argv(0) = toCString("tmux")
+    args.zipWithIndex.foreach { case (a, i) => argv(i + 1) = toCString(a) }
+    argv(args.size + 1) = null
+    unistd.execvp(c"tmux", argv)
+  }
+  System.err.println("tmux-snapshot: failed to exec tmux")
+  sys.exit(127)
 }
 
 /** Runs a command and returns its stdout. Returns None if the exit code is non-zero. */
