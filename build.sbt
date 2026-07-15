@@ -16,7 +16,8 @@ libraryDependencies ++= Seq(
   "io.circe"           %% "circe-generic"   % "0.14.15",
   "io.circe"           %% "circe-parser"    % "0.14.15",
   "io.github.cquiroz" %% "scala-java-time"  % "2.6.0",
-  "com.github.scopt"   %% "scopt"           % "4.1.0"
+  "com.github.scopt"   %% "scopt"           % "4.1.0",
+  "tech.neander"       %% "cue4s"           % "0.0.9"
 )
 
 val nativeCfg: NativeConfig => NativeConfig =
