@@ -524,7 +524,102 @@ case class ListContext(
 def collectListContext(panes: List[ListRawPane]): ListContext = {
   // Distinct paths only: panes frequently share a directory and each lookup forks git.
   val worktrees = panes.map(_.currentPath).distinct.flatMap(p => worktreeInfo(p).map(p -> _)).toMap
-  ListContext(worktrees, Map.empty, Map.empty)
+  val parents   = processParents
+  val sessions  = collectClaudeSessions(panes.map(_.panePid).toSet, parents)
+  ListContext(worktrees, sessions, Map.empty)
+}
+
+/** Reads and decodes a JSON file, degrading to None on any IO or parse failure. */
+def readJson[A: io.circe.Decoder](p: java.nio.file.Path): Option[A] = {
+  try { decode[A](new String(Files.readAllBytes(p), StandardCharsets.UTF_8)).toOption }
+  catch { case _: Throwable => None }
+}
+
+def isoFromMillis(ms: Long): String = java.time.Instant.ofEpochMilli(ms).toString
+
+/** Lists the regular .json files in a directory, or Nil when it is absent or unreadable. */
+def jsonFilesIn(dir: java.nio.file.Path): List[java.io.File] = {
+  try {
+    Option(dir.toFile.listFiles()).map(_.toList).getOrElse(Nil)
+      .filter(f => f.isFile && f.getName.endsWith(".json"))
+  } catch { case _: Throwable => Nil }
+}
+
+/** The fields of ~/.claude/sessions/<pid>.json that `list` reports. Circe ignores the rest,
+ *  so extra fields upstream do not break decoding. */
+case class RawClaudeSession(
+  pid: Int,
+  sessionId: String,
+  cwd: String,
+  name: Option[String],
+  status: Option[String],
+  version: Option[String],
+  startedAt: Option[Long],
+  updatedAt: Option[Long]
+) derives Codec.AsObject
+
+/** pid -> ppid for every process, from a single ps call.
+ *
+ *  /proc/<pid>/stat is deliberately not read directly: /proc reports a file size of 0 and
+ *  Files.readAllBytes's behaviour on such files under Scala Native is unverified. */
+def processParents: Map[Int, Int] = {
+  runCapture(Seq("ps", "-eo", "pid=,ppid=")).map { out =>
+    out.linesIterator.flatMap { l =>
+      l.trim.split(" ").filter(_.nonEmpty) match {
+        case Array(pid, ppid) =>
+          for { p <- pid.toIntOption; q <- ppid.toIntOption } yield p -> q
+        case _ => None
+      }
+    }.toMap
+  }.getOrElse(Map.empty)
+}
+
+/** True when pid is alive and running claude. Session files outlive crashed processes, so
+ *  without this check a recycled pid would attribute a dead session to an unrelated pane. */
+def isClaudeProcess(pid: Int): Boolean = {
+  runCapture(Seq("ps", "-o", "comm=", "-p", pid.toString)).map(_.trim).contains("claude")
+}
+
+/** Walks up the process tree from pid looking for one of targets.
+ *
+ *  A claude process is currently a direct child of the pane's shell, so depth 1 suffices
+ *  today; the walk tolerates a wrapper process appearing in between later. */
+def findAncestor(pid: Int, targets: Set[Int], parents: Map[Int, Int], maxDepth: Int = 10): Option[Int] = {
+  var current            = pid
+  var depth              = 0
+  var found: Option[Int] = None
+  var searching          = true
+  while (searching && depth < maxDepth) {
+    parents.get(current) match {
+      case Some(parent) if targets.contains(parent) => { found = Some(parent); searching = false }
+      // Stop at the top of the tree; pid 1 parents itself in some containers, which would loop.
+      case Some(parent) if parent <= 1 || parent == current => searching = false
+      case Some(parent)                                     => { current = parent; depth += 1 }
+      case None                                             => searching = false
+    }
+  }
+  found
+}
+
+/** Live Claude Code sessions, keyed by the pane_pid of the pane that hosts them. */
+def collectClaudeSessions(panePids: Set[Int], parents: Map[Int, Int]): Map[Int, ClaudeSessionInfo] = {
+  jsonFilesIn(Paths.get(home, ".claude", "sessions")).flatMap { f =>
+    for {
+      raw <- readJson[RawClaudeSession](f.toPath)
+      if isClaudeProcess(raw.pid)
+      pane <- findAncestor(raw.pid, panePids, parents)
+    } yield pane -> ClaudeSessionInfo(
+      sessionId = raw.sessionId,
+      name = raw.name,
+      cwd = raw.cwd,
+      status = raw.status,
+      version = raw.version,
+      pid = raw.pid,
+      startedAt = raw.startedAt.map(isoFromMillis),
+      updatedAt = raw.updatedAt.map(isoFromMillis),
+      firstUserMessage = None
+    )
+  }.toMap
 }
 
 /** Git state of a directory, resolved in one rev-parse call that prints the four requested
