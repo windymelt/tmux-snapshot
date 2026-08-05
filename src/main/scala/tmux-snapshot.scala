@@ -526,7 +526,8 @@ def collectListContext(panes: List[ListRawPane]): ListContext = {
   val worktrees = panes.map(_.currentPath).distinct.flatMap(p => worktreeInfo(p).map(p -> _)).toMap
   val parents   = processParents
   val sessions  = collectClaudeSessions(panes.map(_.panePid).toSet, parents)
-  ListContext(worktrees, sessions, Map.empty)
+  val agents    = collectClaudeAgents(panes.map(_.paneId).toSet)
+  ListContext(worktrees, sessions, agents)
 }
 
 /** Reads and decodes a JSON file, degrading to None on any IO or parse failure. */
@@ -620,6 +621,74 @@ def collectClaudeSessions(panePids: Set[Int], parents: Map[Int, Int]): Map[Int, 
       firstUserMessage = None
     )
   }.toMap
+}
+
+/** The fields of a ~/.claude/teams/<team>/config.json member that `list` reports. The prompt
+ *  field alone reaches several kilobytes, so it is deliberately not decoded. */
+case class RawTeamMember(
+  name: Option[String],
+  agentType: Option[String],
+  model: Option[String],
+  tmuxPaneId: Option[String],
+  joinedAt: Option[Long]
+) derives Codec.AsObject
+
+case class RawTeamConfig(
+  name: Option[String],
+  leadSessionId: Option[String],
+  members: Option[List[RawTeamMember]]
+) derives Codec.AsObject
+
+/** tmux server start time in epoch millis. #{start_time} is in epoch seconds. */
+def tmuxServerStartMillis: Option[Long] = {
+  runCapture(Seq("tmux", "display-message", "-p", "#{start_time}"))
+    .map(_.trim).flatMap(_.toLongOption).map(_ * 1000L)
+}
+
+/** Claude Code agent panes, keyed by the immutable pane id each occupies. Agent panes are
+ *  not registered under ~/.claude/sessions, so they have to be found here.
+ *
+ *  Team configs are never pruned and tmux reuses pane ids across server restarts, so
+ *  matching a live pane id alone misattributes month-old agents: on this machine 20 live
+ *  panes matched a member while only 6 actually hosted an agent. A member that joined
+ *  before the running tmux server started cannot belong to one of its panes, so those are
+ *  dropped and the newest surviving claim on a pane wins.
+ *
+ *  isActive is not consulted: it is false even for panes that are demonstrably running. */
+def collectClaudeAgents(livePaneIds: Set[String]): Map[String, ClaudeAgentInfo] = {
+  tmuxServerStartMillis match {
+    // Without a trustworthy server start time every match is suspect, so report nothing
+    // rather than risk showing a stale agent.
+    case None => Map.empty
+    case Some(serverStart) => {
+      val configs = Option(Paths.get(home, ".claude", "teams").toFile.listFiles())
+        .map(_.toList).getOrElse(Nil)
+        .filter(_.isDirectory)
+        .map(d => new java.io.File(d, "config.json"))
+        .filter(_.isFile)
+
+      val claims = configs.flatMap { f =>
+        readJson[RawTeamConfig](f.toPath).toList.flatMap { cfg =>
+          val teamName = cfg.name.getOrElse(f.getParentFile.getName)
+          cfg.members.getOrElse(Nil).flatMap { m =>
+            for {
+              paneId <- m.tmuxPaneId
+              if livePaneIds.contains(paneId)
+              joined <- m.joinedAt
+              if joined >= serverStart
+              agentName <- m.name
+            } yield (
+              paneId,
+              joined,
+              ClaudeAgentInfo(agentName, m.agentType, m.model, teamName, cfg.leadSessionId)
+            )
+          }
+        }
+      }
+
+      claims.groupBy(_._1).map { case (paneId, cs) => paneId -> cs.maxBy(_._2)._3 }
+    }
+  }
 }
 
 /** Git state of a directory, resolved in one rev-parse call that prints the four requested
