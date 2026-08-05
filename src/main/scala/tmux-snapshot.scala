@@ -522,7 +522,42 @@ case class ListContext(
 )
 
 def collectListContext(panes: List[ListRawPane]): ListContext = {
-  ListContext(Map.empty, Map.empty, Map.empty)
+  // Distinct paths only: panes frequently share a directory and each lookup forks git.
+  val worktrees = panes.map(_.currentPath).distinct.flatMap(p => worktreeInfo(p).map(p -> _)).toMap
+  ListContext(worktrees, Map.empty, Map.empty)
+}
+
+/** Git state of a directory, resolved in one rev-parse call that prints the four requested
+ *  values as four lines. Returns None outside a git repository, where rev-parse exits 128.
+ *
+ *  gitInfo is deliberately left alone: its three return values map 1:1 onto PaneState's
+ *  fields and dump depends on that shape. */
+def worktreeInfo(path: String): Option[WorktreeInfo] = {
+  val out = runCapture(Seq(
+    "git", "-C", path, "rev-parse",
+    "--show-toplevel", "--git-common-dir", "--git-dir", "--abbrev-ref", "HEAD"
+  ))
+  out.flatMap(_.trim.linesIterator.map(_.trim).toList match {
+    case root :: commonDir :: gitDir :: headRef :: Nil => {
+      // Both directories come back relative (".git") when git is run from the repository root,
+      // so resolve them against path before comparing.
+      val base           = Paths.get(path)
+      val resolvedCommon = base.resolve(commonDir).normalize()
+      val resolvedGitDir = base.resolve(gitDir).normalize()
+      // A linked worktree's git dir is .git/worktrees/<name>, which differs from the common
+      // dir; in the main worktree the two are the same path.
+      val isWorktree = resolvedCommon != resolvedGitDir
+      Some(WorktreeInfo(
+        gitRoot = root,
+        // rev-parse prints the literal "HEAD" on a detached HEAD, which is not a branch name.
+        branch = Some(headRef).filter(b => b.nonEmpty && b != "HEAD"),
+        isWorktree = isWorktree,
+        worktreeName = if (isWorktree) { Option(resolvedGitDir.getFileName).map(_.toString) } else { None },
+        mainRoot = if (isWorktree) { Option(resolvedCommon.getParent).map(_.toString) } else { None }
+      ))
+    }
+    case _ => None
+  })
 }
 
 /** Groups panes into windows, preserving the order tmux reported them in. */
