@@ -618,9 +618,97 @@ def collectClaudeSessions(panePids: Set[Int], parents: Map[Int, Int]): Map[Int, 
       pid = raw.pid,
       startedAt = raw.startedAt.map(isoFromMillis),
       updatedAt = raw.updatedAt.map(isoFromMillis),
-      firstUserMessage = None
+      firstUserMessage = firstUserMessageOf(raw.cwd, raw.sessionId)
     )
   }.toMap
+}
+
+/** Maps a working directory to its ~/.claude/projects subdirectory name, which replaces every
+ *  character outside [A-Za-z0-9] with "-". */
+def encodeProjectDir(cwd: String): String = {
+  cwd.map(c => if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) { c } else { '-' })
+}
+
+/** Reads at most `max` bytes from the head of a file. */
+def readHead(p: java.nio.file.Path, max: Int): Option[String] = {
+  try {
+    val in = Files.newInputStream(p)
+    try {
+      val buf = new Array[Byte](max)
+      var off = 0
+      var n   = 0
+      while (off < max && { n = in.read(buf, off, max - off); n > 0 }) { off += n }
+      // A multi-byte character may be cut at the boundary, which only affects the trailing
+      // partial line; that line fails to parse as JSON and is skipped anyway.
+      Some(new String(buf, 0, off, StandardCharsets.UTF_8))
+    } finally { in.close() }
+  } catch { case _: Throwable => None }
+}
+
+/** ASCII ESC (0x1b), which introduces every ANSI escape sequence. Written as a numeric code
+ *  rather than a literal so the source file stays free of raw control bytes. */
+val Esc = 27.toChar
+
+/** Removes ANSI escape sequences and control characters from session-log text.
+ *
+ *  A log entry is arbitrary past input, so echoing it verbatim would let an escape sequence
+ *  recorded in a message reprogram the terminal that renders `list`. Newlines and tabs become
+ *  spaces so a multi-line message stays on one line. */
+def sanitizeForTerminal(s: String): String = {
+  val sb = new StringBuilder
+  var i  = 0
+  while (i < s.length) {
+    val c = s.charAt(i)
+    if (c == Esc) {
+      i += 1
+      if (i < s.length && s.charAt(i) == '[') {
+        // CSI: parameter and intermediate bytes, then a final byte in 0x40..0x7e.
+        i += 1
+        while (i < s.length && !(s.charAt(i) >= '@' && s.charAt(i) <= '~')) { i += 1 }
+        if (i < s.length) { i += 1 }
+      } else if (i < s.length) {
+        // Two-character escape; drop the second byte as well.
+        i += 1
+      }
+    } else if (c == '\n' || c == '\r' || c == '\t') { sb.append(' '); i += 1 }
+    else if (Character.isISOControl(c)) { i += 1 }
+    else { sb.append(c); i += 1 }
+  }
+  // Collapse the space runs that removed newlines and control characters leave behind.
+  sb.toString.split(" ").filter(_.nonEmpty).mkString(" ")
+}
+
+/** Text of a log entry's message. content is a plain string for a typed turn and an array of
+ *  blocks when the turn carries attachments or tool results. */
+def extractMessageText(c: io.circe.ACursor): Option[String] = {
+  val content = c.downField("message").downField("content")
+  content.as[String].toOption.orElse {
+    content.values.flatMap { blocks =>
+      blocks.iterator.flatMap(b => b.hcursor.get[String]("text").toOption).find(_.trim.nonEmpty)
+    }
+  }
+}
+
+/** First human turn of a session log, as a one-line hint of what the pane is working on.
+ *
+ *  Only the head of the file is read: logs reach hundreds of kilobytes, and the first user
+ *  turn appeared by the fourth line in every sample. When it is not within that window this
+ *  degrades to None instead of reading the whole file. */
+def firstUserMessageOf(cwd: String, sessionId: String): Option[String] = {
+  val path = Paths.get(home, ".claude", "projects", encodeProjectDir(cwd), sessionId + ".jsonl")
+  if (!Files.isRegularFile(path)) { None }
+  else {
+    readHead(path, 8192).flatMap { head =>
+      head.linesIterator.flatMap { line =>
+        io.circe.parser.parse(line).toOption
+          .filter(_.hcursor.get[String]("type").toOption.contains("user"))
+          .flatMap(j => extractMessageText(j.hcursor))
+          // Escapes are stripped before truncating so the count reflects visible characters.
+          .map(sanitizeForTerminal)
+          .filter(_.nonEmpty)
+      }.nextOption()
+    }.map(truncateText(_, 40))
+  }
 }
 
 /** The fields of a ~/.claude/teams/<team>/config.json member that `list` reports. The prompt
