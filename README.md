@@ -9,6 +9,7 @@ When you run several Claude Code sessions across tmux windows — one per git wo
 - **`dump`** serializes your tmux sessions — windows, panes, working directories, layout, and the command running in each pane — to JSON.
 - A **systemd user timer** runs `dump` on an interval, so the snapshot stays current.
 - **`restore`** rebuilds your sessions from the latest snapshot: for each saved session it recreates windows and panes in their original order and directories, reapplies pane layouts, and sends `claude -c` to any pane that was running Claude Code so the conversation resumes where it left off.
+- **`list`** inspects your current tmux state — windows, panes, and any active Claude Code sessions or agents — without touching the snapshot.
 
 Every session is saved and restored under its original name. See [Design contract](#design-contract).
 
@@ -19,6 +20,7 @@ Every session is saved and restored under its original name. See [Design contrac
 - **Robust targeting via tmux's immutable pane/window IDs** (`%N` / `@N`) rather than indexes, so restoration stays correct even when window numbering differs from the saved state.
 - **Backups are never clobbered** — `dump` will not overwrite a good snapshot with an empty one.
 - **Claude Code conversations resume automatically** on restore.
+- **Read-only inspection of Claude Code sessions and agents** via `list` — see which panes are running Claude, what their session state is, and which agents are active, without modifying your snapshot.
 
 ## Requirements
 
@@ -84,6 +86,52 @@ tmux-snapshot --session work restore   # restore only the "work" session
 - `restore --session <name>` restores only that session and touches no other. If the snapshot does not contain it, the command fails without changing anything.
 
 Without `--session`, both commands operate on every session, as described in the [Design contract](#design-contract).
+
+### Listing what is running
+
+The `list` command is a **read-only** subcommand that inspects your current tmux state without reading or writing the snapshot. It reports all windows, panes, git information, and any active Claude Code sessions or agents.
+
+```sh
+tmux-snapshot list                 # windows of the current session
+tmux-snapshot list --json          # the same content as JSON
+tmux-snapshot list --session work  # an explicit session
+tmux-snapshot list --all           # every session
+```
+
+The output includes:
+
+- **Window and pane topology** — window indexes, window names, and the working directory of each pane.
+- **Git information** — the branch at that pane's working directory, and (if that pane's directory is a linked worktree) the worktree name and main repository name.
+- **Claude Code session state** — if a pane is running Claude, the session name, state (`idle` / `busy` / `waiting`), the first 8 characters of the session ID, how long it has been running, and an excerpt from the first user message in that conversation.
+- **Agent information** — if a pane is an agent pane, the agent's name, agent type, model, and team name.
+
+Important behaviors:
+
+- **Current session is determined by the calling pane.** `list` resolves the current session from `$TMUX_PANE`, so the session you operate on is the one that contains the pane you ran the command from — not whichever session happens to be active in your tmux client.
+- **If you run `list` outside tmux without `--session` or `--all`, it fails.** A missing tmux server is also a failure. This contrasts with `dump`, which is silent — because `dump` protects a snapshot, but `list` has nothing to protect, so a failure is worth reporting. Exit code is 1 in both cases.
+- **Supplementary information degrades gracefully.** If a pane's directory is not inside a git repository, or if Claude Code information cannot be fetched, `list` omits those lines for that pane and continues — the command always succeeds if it can read tmux state at all.
+- **The window containing the pane you ran the command from is marked.** The `← current` annotation appears next to that window.
+- **Long paths are truncated to a fixed width.** Paths longer than 52 characters are shortened by replacing the left side with `…` and preserving the right end — keeping the worktree name or final directory visible for identification.
+
+Here is a human-readable example:
+
+```
+session 0  (10 windows, 18 panes, attached)
+
+ 6: zsh                                                              ← current
+    1  ~/src/github.com/windymelt/tmux-snapshot                claude
+       git  main
+       cc   tmux-snapshot-cc  busy  df6999e4  2h12m  "Let's think about this together…"
+    2  ~/src/github.com/windymelt/tmux-snapshot                2.1.222
+       git  main
+       cc   agent HQ-list-windows (Headquarter/opus)  team session-df6999e4
+
+ 9: claude
+    1  …/forum/.claude/worktrees/bump-gemini-25-into-3x         claude
+       git  worktree-bump-gemini-25-into-3x  [worktree: bump-gemini-25-into-3x → forum]
+```
+
+When you pass `--json`, `list` returns the same information in machine-readable JSON format. Supplementary fields that could not be retrieved (git info, Claude Code state, agent details) appear as `null` in the JSON output.
 
 ## Design contract
 
