@@ -433,6 +433,7 @@ case class WindowInfo(
   windowName: String,
   windowLayout: String,
   isCurrent: Boolean,
+  sessionAttached: Option[Boolean],
   panes: List[PaneInfo]
 ) derives Codec.AsObject
 
@@ -500,9 +501,10 @@ def currentSessionAndPane: (Option[String], Option[String]) = {
   }
 }
 
-/** Session names the tmux server reports as attached. Returns an empty set when
- *  list-sessions fails, in which case the header simply omits the marker. */
-def attachedSessions: Set[String] = {
+/** Session names the tmux server reports as attached. Returns None when list-sessions fails,
+ *  in which case the header simply omits the marker. Success returns Some(Set) even if no
+ *  sessions are attached. */
+def attachedSessions: Option[Set[String]] = {
   runCapture(Seq("tmux", "list-sessions", "-F", "#{session_name}\t#{session_attached}"))
     .map(_.trim.linesIterator.flatMap { l =>
       l.split("\t", -1) match {
@@ -510,7 +512,6 @@ def attachedSessions: Set[String] = {
         case _                                                                      => None
       }
     }.toSet)
-    .getOrElse(Set.empty)
 }
 
 /** Per-run lookup tables for `list`. Built once so `git`, `ps` and the ~/.claude scans do
@@ -813,7 +814,7 @@ def worktreeInfo(path: String): Option[WorktreeInfo] = {
 }
 
 /** Groups panes into windows, preserving the order tmux reported them in. */
-def buildListing(panes: List[ListRawPane], currentPaneId: Option[String], ctx: ListContext): List[WindowInfo] = {
+def buildListing(panes: List[ListRawPane], currentPaneId: Option[String], ctx: ListContext, attached: Option[Set[String]]): List[WindowInfo] = {
   // window_id is immutable and unique across the server, but pair it with the session name
   // so the grouping key stays meaningful in the output.
   val grouped = scala.collection.mutable.LinkedHashMap.empty[(String, String), List[ListRawPane]]
@@ -845,6 +846,7 @@ def buildListing(panes: List[ListRawPane], currentPaneId: Option[String], ctx: L
       windowName = head.windowName,
       windowLayout = head.windowLayout,
       isCurrent = currentPaneId.exists(id => sorted.exists(_.paneId == id)),
+      sessionAttached = attached.map(_.contains(session)),
       panes = infos
     )
   }
@@ -887,11 +889,12 @@ def list(session: Option[String], all: Boolean, asJson: Boolean): Unit = {
 
   val panes   = parseListPanes(raw.trim.linesIterator.toList)
   val ctx     = collectListContext(panes)
-  val windows = buildListing(panes, currentPaneId, ctx)
+  val attached = attachedSessions
+  val windows = buildListing(panes, currentPaneId, ctx, attached)
   val listing = Listing(java.time.Instant.now().toString, currentSession, currentPaneId, windows)
 
   if (asJson) { println(listing.asJson.spaces2) }
-  else { printListing(listing, attachedSessions) }
+  else { printListing(listing, attached) }
 }
 
 // --- human readable rendering ---
@@ -956,14 +959,14 @@ def padTo(s: String, width: Int): String = {
   if (n >= width) { s } else { s + " " * (width - n) }
 }
 
-def printListing(listing: Listing, attached: Set[String]): Unit = {
+def printListing(listing: Listing, attached: Option[Set[String]]): Unit = {
   val bySession = scala.collection.mutable.LinkedHashMap.empty[String, List[WindowInfo]]
   listing.windows.foreach(w => bySession(w.session) = bySession.getOrElse(w.session, Nil) :+ w)
 
   bySession.toList.zipWithIndex.foreach { case ((name, windows), i) =>
     if (i > 0) { println() }
     val paneCount = windows.map(_.panes.size).sum
-    val marker    = if (attached.contains(name)) { ", attached" } else { "" }
+    val marker    = if (attached.exists(_.contains(name))) { ", attached" } else { "" }
     println(s"session $name  (${windows.size} windows, $paneCount panes$marker)")
     windows.foreach { w => println(); printWindow(w) }
   }

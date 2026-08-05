@@ -131,7 +131,7 @@ session 0  (10 windows, 18 panes, attached)
        git  worktree-bump-gemini-25-into-3x  [worktree: bump-gemini-25-into-3x → forum]
 ```
 
-When you pass `--json`, `list` returns the same information in machine-readable JSON format. Supplementary fields that could not be retrieved (git info, Claude Code state, agent details) appear as `null` in the JSON output.
+When you pass `--json`, `list` returns the same information in machine-readable JSON format. Supplementary fields that could not be retrieved (git info, Claude Code state, agent details, session attachment state) appear as `null` in the JSON output.
 
 ## Design contract
 
