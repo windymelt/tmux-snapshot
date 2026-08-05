@@ -42,11 +42,14 @@ val defaultStateFile = Paths.get(home, ".local", "share", "tmux-snapshot", "stat
 /** Logger that discards both stdout and stderr. Used to suppress error output from tmux and git. */
 val sink = ProcessLogger(_ => (), _ => ())
 
-/** Parsed command-line config. When session is Some, dump/restore targets only that session. */
+/** Parsed command-line config. When session is Some, dump/restore/list targets only that session.
+ *  json and all are only read by list; dump and restore ignore them silently. */
 case class Config(
   command: String = "",
   stateFile: java.nio.file.Path = defaultStateFile,
-  session: Option[String] = None
+  session: Option[String] = None,
+  json: Boolean = false,
+  all: Boolean = false
 )
 
 val cliParser = {
@@ -62,13 +65,20 @@ val cliParser = {
       .valueName("<name>")
       .action((x, c) => c.copy(session = Some(x)))
       .text("target session name"),
+    opt[Unit]("json")
+      .action((_, c) => c.copy(json = true))
+      .text("emit JSON (list only)"),
+    opt[Unit]("all")
+      .action((_, c) => c.copy(all = true))
+      .text("target every session (list only)"),
+    help("help").text("show this message"),
     arg[String]("<command>")
       .action((x, c) => c.copy(command = x))
       .validate(x =>
-        if (x == "dump" || x == "restore") success
-        else failure(s"command must be dump or restore: $x")
+        if (x == "dump" || x == "restore" || x == "list") success
+        else failure(s"command must be dump, restore or list: $x")
       )
-      .text("command to run (dump or restore)")
+      .text("command to run (dump, restore or list)")
   )
 }
 
@@ -82,6 +92,7 @@ object Main {
         cfg.command match {
           case "dump"    => dump(cfg.stateFile, cfg.session)
           case "restore" => restore(cfg.stateFile, cfg.session)
+          case "list"    => list(cfg.session, cfg.all, cfg.json)
         }
       case None => sys.exit(1)
     }
@@ -362,6 +373,353 @@ def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit 
           Process(Seq("tmux", "send-keys", "-t", paneId, "claude -c", "Enter")).!
         }
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// list subcommand
+// ---------------------------------------------------------------------------
+
+/** Git state of a pane's directory. mainRoot and worktreeName are only meaningful for a
+ *  linked worktree. branch is None on a detached HEAD. */
+case class WorktreeInfo(
+  gitRoot: String,
+  branch: Option[String],
+  isWorktree: Boolean,
+  worktreeName: Option[String],
+  mainRoot: Option[String]
+) derives Codec.AsObject
+
+/** A live Claude Code interactive session, read from ~/.claude/sessions/<pid>.json. */
+case class ClaudeSessionInfo(
+  sessionId: String,
+  name: Option[String],
+  cwd: String,
+  status: Option[String],
+  version: Option[String],
+  pid: Int,
+  startedAt: Option[String],
+  updatedAt: Option[String],
+  firstUserMessage: Option[String]
+) derives Codec.AsObject
+
+/** A Claude Code agent occupying a pane, read from ~/.claude/teams/<team>/config.json.
+ *  Agent panes are not registered in ~/.claude/sessions. */
+case class ClaudeAgentInfo(
+  agentName: String,
+  agentType: Option[String],
+  model: Option[String],
+  teamName: String,
+  leadSessionId: Option[String]
+) derives Codec.AsObject
+
+case class PaneInfo(
+  paneId: String,
+  paneIndex: Int,
+  paneTty: String,
+  panePid: Int,
+  currentPath: String,
+  runningCommand: String,
+  worktree: Option[WorktreeInfo],
+  claudeSession: Option[ClaudeSessionInfo],
+  claudeAgent: Option[ClaudeAgentInfo]
+) derives Codec.AsObject
+
+case class WindowInfo(
+  session: String,
+  windowId: String,
+  windowIndex: Int,
+  windowName: String,
+  windowLayout: String,
+  isCurrent: Boolean,
+  panes: List[PaneInfo]
+) derives Codec.AsObject
+
+case class Listing(
+  generatedAt: String,
+  currentSession: Option[String],
+  currentPaneId: Option[String],
+  windows: List[WindowInfo]
+) derives Codec.AsObject
+
+/** Raw tmux fields for one pane, in listFormat order.
+ *
+ *  This parser is deliberately separate from buildWindows. buildWindows matches a fixed
+ *  7-element Array, so adding fields to dump's format string would send every pane to its
+ *  `case _ => None` branch and make dump write an empty snapshot. dump runs unattended on a
+ *  timer, so that failure would go unnoticed. */
+case class ListRawPane(
+  session: String,
+  windowId: String,
+  windowIndex: Int,
+  windowName: String,
+  windowLayout: String,
+  paneId: String,
+  paneIndex: Int,
+  panePid: Int,
+  paneTty: String,
+  currentPath: String,
+  command: String
+)
+
+val listFormat = List(
+  "#{session_name}", "#{window_id}", "#{window_index}", "#{window_name}", "#{window_layout}",
+  "#{pane_id}", "#{pane_index}", "#{pane_pid}", "#{pane_tty}", "#{pane_current_path}",
+  "#{pane_current_command}"
+).mkString("\t")
+
+def parseListPanes(lines: List[String]): List[ListRawPane] = lines.flatMap { line =>
+  // Limit -1 keeps trailing empty fields so the arity is always 11.
+  line.split("\t", -1) match {
+    case Array(sess, wid, widxStr, wname, layout, pid, pidxStr, ppidStr, tty, path, cmd) =>
+      for {
+        widx <- widxStr.toIntOption
+        pidx <- pidxStr.toIntOption
+        ppid <- ppidStr.toIntOption
+      } yield ListRawPane(sess, wid, widx, wname, layout, pid, pidx, ppid, tty, path, cmd)
+    case _ => None
+  }
+}
+
+/** Resolves the session name and pane id of the pane this process is running in.
+ *
+ *  $TMUX is the only reliable "am I inside tmux" signal: `tmux display-message` exits 0
+ *  outside tmux too and reports the last active session, so its exit code cannot be used.
+ *  -t is mandatory — without it display-message answers for the client's active pane, which
+ *  is a different pane than the one this process runs in whenever the two diverge. */
+def currentSessionAndPane: (Option[String], Option[String]) = {
+  if (sys.env.get("TMUX").isEmpty) { (None, None) }
+  else {
+    val paneId = sys.env.get("TMUX_PANE").map(_.trim).filter(_.nonEmpty)
+    val session = paneId.flatMap { p =>
+      runCapture(Seq("tmux", "display-message", "-p", "-t", p, "#{session_name}"))
+        .map(_.trim).filter(_.nonEmpty)
+    }
+    (session, paneId)
+  }
+}
+
+/** Session names the tmux server reports as attached. Returns an empty set when
+ *  list-sessions fails, in which case the header simply omits the marker. */
+def attachedSessions: Set[String] = {
+  runCapture(Seq("tmux", "list-sessions", "-F", "#{session_name}\t#{session_attached}"))
+    .map(_.trim.linesIterator.flatMap { l =>
+      l.split("\t", -1) match {
+        case Array(name, attached) if attached.trim.nonEmpty && attached.trim != "0" => Some(name)
+        case _                                                                      => None
+      }
+    }.toSet)
+    .getOrElse(Set.empty)
+}
+
+/** Per-run lookup tables for `list`. Built once so `git`, `ps` and the ~/.claude scans do
+ *  not run per pane. Every field degrades to empty rather than failing the whole listing. */
+case class ListContext(
+  worktrees: Map[String, WorktreeInfo],
+  sessionsByPanePid: Map[Int, ClaudeSessionInfo],
+  agentsByPaneId: Map[String, ClaudeAgentInfo]
+)
+
+def collectListContext(panes: List[ListRawPane]): ListContext = {
+  ListContext(Map.empty, Map.empty, Map.empty)
+}
+
+/** Groups panes into windows, preserving the order tmux reported them in. */
+def buildListing(panes: List[ListRawPane], currentPaneId: Option[String], ctx: ListContext): List[WindowInfo] = {
+  // window_id is immutable and unique across the server, but pair it with the session name
+  // so the grouping key stays meaningful in the output.
+  val grouped = scala.collection.mutable.LinkedHashMap.empty[(String, String), List[ListRawPane]]
+  panes.foreach { p =>
+    val key = (p.session, p.windowId)
+    grouped(key) = grouped.getOrElse(key, Nil) :+ p
+  }
+
+  grouped.toList.map { case ((session, windowId), ps) =>
+    val sorted = ps.sortBy(_.paneIndex)
+    val head   = sorted.head
+    val infos = sorted.map { p =>
+      PaneInfo(
+        paneId = p.paneId,
+        paneIndex = p.paneIndex,
+        paneTty = p.paneTty,
+        panePid = p.panePid,
+        currentPath = p.currentPath,
+        runningCommand = p.command,
+        worktree = ctx.worktrees.get(p.currentPath),
+        claudeSession = ctx.sessionsByPanePid.get(p.panePid),
+        claudeAgent = ctx.agentsByPaneId.get(p.paneId)
+      )
+    }
+    WindowInfo(
+      session = session,
+      windowId = windowId,
+      windowIndex = head.windowIndex,
+      windowName = head.windowName,
+      windowLayout = head.windowLayout,
+      isCurrent = currentPaneId.exists(id => sorted.exists(_.paneId == id)),
+      panes = infos
+    )
+  }
+}
+
+def list(session: Option[String], all: Boolean, asJson: Boolean): Unit = {
+  // Unlike dump, which stays silent to protect the snapshot, list has nothing to protect
+  // and reports the failure instead.
+  if (!isTmuxRunning) {
+    System.err.println("tmux-snapshot: no tmux server is running")
+    sys.exit(1)
+  }
+
+  val (currentSession, currentPaneId) = currentSessionAndPane
+  val target: Option[String] =
+    if (all) { None }
+    else {
+      session.orElse(currentSession) match {
+        case Some(s) => Some(s)
+        case None => {
+          System.err.println("tmux-snapshot: not running inside tmux; pass --session <name> or --all")
+          sys.exit(1)
+        }
+      }
+    }
+
+  val listCmd = target match {
+    // Append ":" so a numeric session name is not read as a window index.
+    case Some(s) => Seq("tmux", "list-panes", "-s", "-t", s + ":", "-F", listFormat)
+    case None    => Seq("tmux", "list-panes", "-a", "-F", listFormat)
+  }
+
+  val raw = runCapture(listCmd) match {
+    case Some(r) => r
+    case None => {
+      System.err.println(target.fold("tmux-snapshot: failed to list panes")(s => s"tmux-snapshot: session '$s' not found"))
+      sys.exit(1)
+    }
+  }
+
+  val panes   = parseListPanes(raw.trim.linesIterator.toList)
+  val ctx     = collectListContext(panes)
+  val windows = buildListing(panes, currentPaneId, ctx)
+  val listing = Listing(java.time.Instant.now().toString, currentSession, currentPaneId, windows)
+
+  if (asJson) { println(listing.asJson.spaces2) }
+  else { printListing(listing, attachedSessions) }
+}
+
+// --- human readable rendering ---
+
+/** Replaces a leading $HOME with "~". */
+def abbreviateHome(path: String): String = {
+  if (path == home) { "~" }
+  else if (path.startsWith(home + "/")) { "~" + path.drop(home.length) }
+  else { path }
+}
+
+/** Shortens a path to at most `max` code points by dropping leading path components and
+ *  prefixing "…". The tail is kept rather than the head because a worktree or repository
+ *  name sits at the end and is what identifies the pane, while the head is nearly always
+ *  "~/src/github.com/<owner>/" and carries little information. */
+def shortenPath(path: String, max: Int = 52): String = {
+  if (path.codePointCount(0, path.length) <= max) { path }
+  else {
+    // Suffixes are generated longest-first, so the first one that fits is the longest one.
+    val fitting = path.indices.iterator
+      .filter(i => path.charAt(i) == '/')
+      .map(i => path.substring(i))
+      .find(s => s.codePointCount(0, s.length) + 1 <= max)
+    fitting match {
+      case Some(s) => "…" + s
+      case None => {
+        // A single component is longer than the budget, so no "/" boundary suffix fits.
+        "…" + path.substring(path.offsetByCodePoints(path.length, -(max - 1)))
+      }
+    }
+  }
+}
+
+/** Truncates to `max` code points, appending "…" only when something was actually dropped. */
+def truncateText(s: String, max: Int): String = {
+  if (s.codePointCount(0, s.length) <= max) { s }
+  else { s.substring(0, s.offsetByCodePoints(0, max)) + "…" }
+}
+
+/** Renders a duration as "2h12m", or "12m" when under an hour. */
+def humanDuration(millis: Long): String = {
+  val minutes = millis / 60000L
+  val h       = minutes / 60
+  val m       = minutes % 60
+  if (h > 0) { s"${h}h${m}m" } else { s"${m}m" }
+}
+
+/** Uptime from an ISO8601 instant to now. None when the string cannot be parsed. */
+def uptimeSince(iso: String): Option[String] = {
+  try {
+    val started = java.time.Instant.parse(iso).toEpochMilli
+    val now     = java.time.Instant.now().toEpochMilli
+    if (now >= started) { Some(humanDuration(now - started)) } else { None }
+  } catch { case _: Throwable => None }
+}
+
+/** Pads to `width` columns, counting code points. Returns the string unchanged when it is
+ *  already at least that wide, so a long field pushes the next column right instead of
+ *  being cut. */
+def padTo(s: String, width: Int): String = {
+  val n = s.codePointCount(0, s.length)
+  if (n >= width) { s } else { s + " " * (width - n) }
+}
+
+def printListing(listing: Listing, attached: Set[String]): Unit = {
+  val bySession = scala.collection.mutable.LinkedHashMap.empty[String, List[WindowInfo]]
+  listing.windows.foreach(w => bySession(w.session) = bySession.getOrElse(w.session, Nil) :+ w)
+
+  bySession.toList.zipWithIndex.foreach { case ((name, windows), i) =>
+    if (i > 0) { println() }
+    val paneCount = windows.map(_.panes.size).sum
+    val marker    = if (attached.contains(name)) { ", attached" } else { "" }
+    println(s"session $name  (${windows.size} windows, $paneCount panes$marker)")
+    windows.foreach { w => println(); printWindow(w) }
+  }
+}
+
+def printWindow(w: WindowInfo): Unit = {
+  val head = f" ${w.windowIndex}%2d: ${w.windowName}%s"
+  println(if (w.isCurrent) { padTo(head, 69) + "← current" } else { head })
+
+  w.panes.foreach { p =>
+    val path = shortenPath(abbreviateHome(p.currentPath))
+    println(s"    ${p.paneIndex}  ${padTo(path, 52)}  ${p.runningCommand}")
+
+    // Omitted entirely for panes outside a git repository, and each field is omitted when
+    // it could not be resolved.
+    p.worktree.foreach { wt =>
+      val tag =
+        if (wt.isWorktree) {
+          (wt.worktreeName, wt.mainRoot.map(r => Paths.get(r).getFileName.toString)) match {
+            case (Some(n), Some(main)) => Some(s"[worktree: $n → $main]")
+            case (Some(n), None)       => Some(s"[worktree: $n]")
+            case _                     => None
+          }
+        } else { None }
+      val fields = List(wt.branch, tag).flatten
+      if (fields.nonEmpty) { println("       git  " + fields.mkString("  ")) }
+    }
+
+    p.claudeSession.foreach { cs =>
+      val fields = List(
+        cs.name,
+        cs.status,
+        Some(cs.sessionId.take(8)),
+        cs.startedAt.flatMap(uptimeSince),
+        cs.firstUserMessage.map(m => "\"" + m + "\"")
+      ).flatten
+      println("       cc   " + fields.mkString("  "))
+    }
+
+    p.claudeAgent.foreach { ca =>
+      val meta = List(ca.agentType, ca.model).flatten.mkString("/")
+      val head = if (meta.nonEmpty) { s"agent ${ca.agentName} ($meta)" } else { s"agent ${ca.agentName}" }
+      println("       cc   " + List(head, s"team ${ca.teamName}").mkString("  "))
     }
   }
 }
