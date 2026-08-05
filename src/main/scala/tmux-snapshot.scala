@@ -970,7 +970,7 @@ def printListing(listing: Listing, attached: Set[String]): Unit = {
 }
 
 def printWindow(w: WindowInfo): Unit = {
-  val head = f" ${w.windowIndex}%2d: ${w.windowName}%s"
+  val head = f"${w.windowIndex}%2d: ${w.windowName}%s"
   println(if (w.isCurrent) { padTo(head, 69) + "← current" } else { head })
 
   w.panes.foreach { p =>
