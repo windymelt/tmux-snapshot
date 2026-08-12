@@ -7,3 +7,6 @@
 target/
 project/target/
 project/project/
+
+# Native binary produced by build.sh
+/tmux-snapshot
