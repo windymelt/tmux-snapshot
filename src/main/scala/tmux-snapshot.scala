@@ -174,18 +174,17 @@ def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   if (!isTmuxRunning) { return }
 
   // Fetch session/window/layout/pane/command info per pane in one call
-  val format  = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}"
   val listCmd = session match {
     // Append ":" to the session name to disambiguate. Numeric session names like "0" or "1"
     // would be interpreted as window indexes by tmux without the trailing colon.
-    case Some(s) => Seq("tmux", "list-panes", "-s", "-t", s + ":", "-F", format)
-    case None    => Seq("tmux", "list-panes", "-a", "-F", format)
+    case Some(s) => Seq("tmux", "list-panes", "-s", "-t", s + ":", "-F", listFormat)
+    case None    => Seq("tmux", "list-panes", "-a", "-F", listFormat)
   }
   runCapture(listCmd) match {
     case None => return
     case Some(raw) => {
       val lines    = raw.trim.linesIterator.toList
-      val captured = buildWindows(lines)
+      val captured = buildWindows(parseListPanes(lines))
       // tmux reported panes but none of them parsed, which means the format string and the parser
       // have diverged. Writing now would replace a good snapshot with an empty one, and dump runs
       // unattended on a timer, so that loss would go unnoticed until a restore was needed.
@@ -209,43 +208,23 @@ def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   }
 }
 
-/** Converts a list of tab-separated lines into a list of WindowState, preserving window order. */
-def buildWindows(lines: List[String]): List[WindowState] = {
-  case class RawPane(
-    session: String,
-    windowIndex: Int,
-    windowName: String,
-    windowLayout: String,
-    paneIndex: Int,
-    currentPath: String,
-    command: String
-  )
-
-  val rawPanes: List[RawPane] = lines.flatMap { line =>
-    line.split("\t") match {
-      case Array(session, widxStr, wname, layout, pidxStr, path, cmd) =>
-        for {
-          widx <- widxStr.toIntOption
-          pidx <- pidxStr.toIntOption
-        } yield RawPane(session, widx, wname, layout, pidx, path, cmd)
-      case _ => None
-    }
-  }
-
+/** Converts parsed panes into a list of WindowState, preserving the order tmux reported
+ *  windows in. */
+def buildWindows(panes: List[ListRawPane]): List[WindowState] = {
   // Group by (session, windowIndex) using LinkedHashMap to preserve insertion order
-  val grouped = scala.collection.mutable.LinkedHashMap.empty[(String, Int), List[RawPane]]
-  rawPanes.foreach { rp =>
-    val key = (rp.session, rp.windowIndex)
-    grouped(key) = grouped.getOrElse(key, Nil) :+ rp
+  val grouped = scala.collection.mutable.LinkedHashMap.empty[(String, Int), List[ListRawPane]]
+  panes.foreach { p =>
+    val key = (p.session, p.windowIndex)
+    grouped(key) = grouped.getOrElse(key, Nil) :+ p
   }
 
-  grouped.toList.map { case ((session, widx), panes) =>
-    val sorted     = panes.sortBy(_.paneIndex)
+  grouped.toList.map { case ((session, widx), ps) =>
+    val sorted     = ps.sortBy(_.paneIndex)
     val windowName = sorted.head.windowName
     val layout     = sorted.head.windowLayout
-    val paneStates = sorted.map { rp =>
-      val (gitRoot, branch, isWorktree) = gitInfo(rp.currentPath)
-      PaneState(rp.paneIndex, rp.currentPath, rp.command, gitRoot, branch, isWorktree)
+    val paneStates = sorted.map { p =>
+      val (gitRoot, branch, isWorktree) = gitInfo(p.currentPath)
+      PaneState(p.paneIndex, p.currentPath, p.command, gitRoot, branch, isWorktree)
     }
     WindowState(session, widx, windowName, layout, paneStates)
   }
@@ -455,12 +434,11 @@ case class Listing(
   windows: List[WindowInfo]
 ) derives Codec.AsObject
 
-/** Raw tmux fields for one pane, in listFormat order.
+/** Raw tmux fields for one pane, in listFormat order. Both `dump` and `list` go through this
+ *  parser, so the two subcommands cannot drift apart in what they ask tmux for.
  *
- *  This parser is deliberately separate from buildWindows. buildWindows matches a fixed
- *  7-element Array, so adding fields to dump's format string would send every pane to its
- *  `case _ => None` branch and make dump write an empty snapshot. dump runs unattended on a
- *  timer, so that failure would go unnoticed. */
+ *  `dump` uses a subset of the fields; pane_id, pane_pid and pane_tty exist for `list`, except
+ *  that pane_pid also lets `dump` attribute a Claude session to the pane hosting it. */
 case class ListRawPane(
   session: String,
   windowId: String,
