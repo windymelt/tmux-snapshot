@@ -27,22 +27,96 @@ Every session is saved and restored under its original name. See [Design contrac
 - [tmux](https://github.com/tmux/tmux)
 - git
 - [Claude Code](https://claude.com/claude-code) (`claude`), version 2.1.223 or later — for conversation resume by session ID (`claude --resume <session-id>`, which resolves IDs across projects starting from that version)
-- To build: [scala-cli](https://scala-cli.virtuslab.org/) and an LLVM/Clang toolchain (a Scala Native requirement)
+- To build from source: [sbt](https://www.scala-sbt.org/) 2.x, JDK 17+, and a Clang/LLVM toolchain (a Scala Native requirement); not required if you use a prebuilt binary from [Releases](https://github.com/windymelt/tmux-snapshot/releases)
 
 ## Installation
 
-Build the binary:
+### Getting a prebuilt binary
+
+Releases are available for Linux on `x86_64` and `aarch64`. Download from [Releases](https://github.com/windymelt/tmux-snapshot/releases).
+
+**Requirements:** glibc 2.35 or later. This is available on Ubuntu 22.04 and later, and Debian 12 and later.
+
+To download, verify, and install:
 
 ```sh
-scala-cli package --native tmux-snapshot.scala -o ~/.local/bin/tmux-snapshot
+version=0.1.0
+target=x86_64-linux  # Change to aarch64-linux if needed
+
+# Download the binary with its original name
+curl -LO https://github.com/windymelt/tmux-snapshot/releases/download/v${version}/tmux-snapshot-${version}-${target}
+
+# Download and verify checksums
+curl -L https://github.com/windymelt/tmux-snapshot/releases/download/v${version}/checksums.txt -o checksums.txt
+# --ignore-missing is needed because checksums.txt contains entries for both targets,
+# but you may have downloaded only one
+sha256sum --check --ignore-missing checksums.txt
+
+# Verify provenance attestation
+gh attestation verify tmux-snapshot-${version}-${target} --repo windymelt/tmux-snapshot
+
+# Install the binary
+chmod +x tmux-snapshot-${version}-${target}
+mv tmux-snapshot-${version}-${target} ~/.local/bin/tmux-snapshot
 ```
 
-The first build compiles LLVM-linked native code and takes a little while; afterwards you just run the binary.
+### Build from source
 
-Install the systemd user units:
+Requirements: [sbt](https://www.scala-sbt.org/) 2.x, JDK 17+, and a Clang/LLVM toolchain (a Scala Native requirement).
+
+Build and install:
 
 ```sh
-cp systemd/tmux-snapshot.service systemd/tmux-snapshot.timer ~/.config/systemd/user/
+sbt nativeLink
+cp target/out/native0.5/scala-3.3.8/tmux-snapshot/tmux-snapshot ~/.local/bin/
+```
+
+Alternatively, you can use the convenience script at the repository root:
+
+```sh
+./build.sh
+```
+
+This runs `sbt nativeLink` and copies the binary to `./tmux-snapshot` in the current directory.
+
+The first build compiles LLVM-linked native code and takes a few minutes; subsequent builds are incremental.
+
+### systemd user units
+
+Create the directory and install the systemd user units:
+
+```sh
+mkdir -p ~/.config/systemd/user
+
+cat > ~/.config/systemd/user/tmux-snapshot.service <<'EOF'
+[Unit]
+Description=Save tmux/worktree snapshot
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmux-snapshot dump
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EOF
+
+cat > ~/.config/systemd/user/tmux-snapshot.timer <<'EOF'
+[Unit]
+Description=Periodic tmux/worktree snapshot
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+```
+
+The `ExecStart` directive points to `~/.local/bin/tmux-snapshot`, which matches the installation path shown above. If you installed the binary to a different location, edit `ExecStart` accordingly. If you have cloned the repository, you can alternatively copy the unit files directly: `cp systemd/tmux-snapshot.service systemd/tmux-snapshot.timer ~/.config/systemd/user/`.
+
+Enable and start the timer:
+
+```sh
 systemctl --user daemon-reload
 systemctl --user enable --now tmux-snapshot.timer
 ```

@@ -12,7 +12,7 @@ sbt compile
 sbt nativeLink
 
 # Install the binary
-cp target/scala-3.3.8/tmux-snapshot-out ~/.local/bin/tmux-snapshot
+cp target/out/native0.5/scala-3.3.8/tmux-snapshot/tmux-snapshot ~/.local/bin/tmux-snapshot
 ```
 
 The first build compiles and links LLVM-generated native code and takes a few minutes; subsequent builds are incremental and fast.
