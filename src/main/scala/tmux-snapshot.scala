@@ -298,8 +298,8 @@ def restore(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
           // inside a live tmux session.
           println(s"Session '$sessionName' already exists; skipping restore for it.")
         } else {
-          createWindow(sessionName, sorted.head, isFirstWindow = true)
-          sorted.tail.foreach(w => createWindow(sessionName, w, isFirstWindow = false))
+          createWindow(sessionName, sorted.head, isFirstWindow = true, version = snap.version)
+          sorted.tail.foreach(w => createWindow(sessionName, w, isFirstWindow = false, version = snap.version))
         }
       }
       println("Done.")
@@ -307,27 +307,44 @@ def restore(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   }
 }
 
-/** Resolves the working directory for a pane. Returns currentPath if it exists,
- *  falls back to gitRoot (useful when a worktree is gone but the repo remains),
- *  then to home. Always returns a valid directory so window creation never fails
- *  due to a missing path, even for the first pane of a session. */
+def isDir(p: String): Boolean = {
+  try { Files.isDirectory(Paths.get(p)) }
+  catch { case _: Throwable => false }
+}
+
+/** The pane's saved directory, or None once it is gone. Callers that must know whether the pane
+ *  was placed where it was saved use this rather than resolveDir, which hides the difference. */
+def savedDir(pane: PaneState): Option[String] = Some(pane.currentPath).filter(isDir)
+
+/** Resolves the working directory for a pane. Returns currentPath if it exists, falls back to
+ *  gitRoot, then to home. Always returns a valid directory so window creation never fails due to
+ *  a missing path, even for the first pane of a session.
+ *
+ *  The gitRoot fallback only helps when the pane sat in a subdirectory of a repository and that
+ *  subdirectory alone was removed. It does not rescue a deleted linked worktree: gitInfo records
+ *  `git rev-parse --show-toplevel`, which inside a linked worktree is the worktree itself, so
+ *  gitRoot ceases to exist along with it and the pane falls through to home. */
 def resolveDir(pane: PaneState): String = {
-  def isDir(p: String): Boolean = {
-    try { Files.isDirectory(Paths.get(p)) }
-    catch { case _: Throwable => false }
+  savedDir(pane).orElse(pane.gitRoot.filter(isDir)).getOrElse(home)
+}
+
+/** Session ids are pasted into a pane's shell by send-keys, where any character the shell treats
+ *  specially would run as a command. Ids are UUIDs, so anything outside that character set is
+ *  refused instead of quoted. */
+def isSafeSessionId(id: String): Boolean = {
+  id.nonEmpty && id.length <= 64 && id.forall { c =>
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'
   }
-  if (isDir(pane.currentPath)) { pane.currentPath }
-  else { pane.gitRoot.filter(isDir).getOrElse(home) }
 }
 
 /** Restores one window. Additional panes are added with split-window and the saved layout
- *  is applied at the end. Panes that were running claude receive "claude -c" to resume
- *  the conversation.
+ *  is applied at the end. Panes that were running claude may receive a resume command; see
+ *  resumeClaude for the conditions.
  *
  *  Pane and window targets use tmux's immutable IDs (pane_id=%N, window_id=@N) rather than
  *  indexes (session:window.pane). Indexes are renumbered on session creation and diverge from
  *  saved values; immutable IDs are fixed at creation and always point to the right target. */
-def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit = {
+def createWindow(session: String, w: WindowState, isFirstWindow: Boolean, version: Int): Unit = {
   val sortedPanes = w.panes.sortBy(_.paneIndex)
   val firstPane   = sortedPanes.head
 
@@ -369,13 +386,39 @@ def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit 
           .foreach(winId => Process(Seq("tmux", "select-layout", "-t", winId, w.windowLayout)).!)
       }
 
-      // Send "claude -c" to panes that were running claude to resume the most recent
-      // conversation in that directory (-c skips the picker).
       paneMapping.foreach { case (paneId, savedPane) =>
-        if (savedPane.runningCommand == "claude") {
-          Process(Seq("tmux", "send-keys", "-t", paneId, "claude -c", "Enter")).!
-        }
+        if (savedPane.runningCommand == "claude") { resumeClaude(session, w, paneId, savedPane, version) }
       }
+    }
+  }
+}
+
+/** Reopens the Claude conversation a pane was holding, and reports on stdout what each pane got
+ *  or why it got nothing, so a manual restore can be checked.
+ *
+ *  `claude --resume <id>` reopens one identified conversation. `claude -c` does not: it takes the
+ *  most recent conversation of the current directory, so several panes sharing a directory all
+ *  land on the same one, and a worktree pane picks up a conversation that belongs elsewhere. It
+ *  is therefore used only for version 0 snapshots, which carry no ids at all. In a version 1
+ *  snapshot a missing id means dump could not identify the session, and guessing there would
+ *  reintroduce exactly that bug.
+ *
+ *  Nothing is sent when the pane could not be placed in its saved directory: the conversation
+ *  belongs to that tree, and resuming it from the fallback directory would misattribute it. */
+def resumeClaude(session: String, w: WindowState, paneId: String, pane: PaneState, version: Int): Unit = {
+  val label = s"$session:${w.windowIndex}.${pane.paneIndex} ($paneId)"
+  def send(cmd: String): Unit = {
+    Process(Seq("tmux", "send-keys", "-t", paneId, cmd, "Enter")).!
+    println(s"  $label: sent '$cmd'")
+  }
+  if (savedDir(pane).isEmpty) {
+    println(s"  $label: saved directory ${pane.currentPath} is gone; left as a shell")
+  } else {
+    pane.claudeSessionId match {
+      case Some(id) if isSafeSessionId(id) => send(s"claude --resume $id")
+      case Some(_)                         => println(s"  $label: recorded session id is not a plausible id; left as a shell")
+      case None if version <= 0            => send("claude -c")
+      case None                            => println(s"  $label: no session id was recorded; left as a shell")
     }
   }
 }
