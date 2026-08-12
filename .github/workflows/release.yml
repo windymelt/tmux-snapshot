@@ -25,6 +25,32 @@ jobs:
           java-version: 17
       - uses: sbt/setup-sbt@8feba82adc7f01ddcf8165b86f778bdb5b82cebc # v1.5.7
 
+      # ubuntu-22.04 ships clang 14, which Scala Native reports as deprecated
+      # and whose ThinLTO aborts on conflicting 'PIC Level' module flags.
+      # jammy's own archive stops at clang 15, so LLVM's apt repository
+      # supplies 18. Moving to a newer runner instead would raise the minimum
+      # glibc above 2.35 and drop Debian 12 and Ubuntu 22.04 users.
+      - name: Install clang 18
+        env:
+          LLVM_VERSION: '18'
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-${LLVM_VERSION} main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-toolchain.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            "clang-${LLVM_VERSION}" \
+            "lld-${LLVM_VERSION}" \
+            "llvm-${LLVM_VERSION}" \
+            "llvm-${LLVM_VERSION}-linker-tools"
+          # Scala Native resolves its toolchain by running `which
+          # $LLVM_BIN/clang`, so LLVM_BIN must be a directory holding the
+          # binaries under their unversioned names. /usr/lib/llvm-18/bin does;
+          # /usr/bin holds only the clang-18 suffixed symlinks.
+          echo "LLVM_BIN=/usr/lib/llvm-${LLVM_VERSION}/bin" >> "$GITHUB_ENV"
+          "/usr/lib/llvm-${LLVM_VERSION}/bin/clang" --version
+
       - name: Extract version from tag
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
