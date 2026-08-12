@@ -9,14 +9,19 @@ import scala.scalanative.unsafe.*
 import scala.scalanative.posix.unistd
 import cue4s.*
 
-/** Per-pane state. runningCommand is the foreground command name at dump time. */
+/** Per-pane state. runningCommand is the foreground command name at dump time.
+ *
+ *  claudeSessionId identifies the conversation the pane was hosting, so restore can reopen that
+ *  exact one. It is absent in snapshots written before version 1, and None whenever dump could
+ *  not attribute a single session to the pane. */
 case class PaneState(
   paneIndex: Int,
   currentPath: String,
   runningCommand: String,
   gitRoot: Option[String],
   branch: Option[String],
-  isWorktree: Boolean
+  isWorktree: Boolean,
+  claudeSessionId: Option[String] = None
 ) derives Codec.AsObject
 
 /** Per-window state. windowLayout is the tmux layout string. */
@@ -34,6 +39,13 @@ case class Snapshot(
   savedAt: String,
   windows: List[WindowState]
 ) derives Codec.AsObject
+
+/** Version written into new snapshots.
+ *
+ *  0 carries no per-pane Claude session id, so restore can only fall back to `claude -c`.
+ *  1 records one, and a pane without one in a version 1 snapshot is a pane whose session dump
+ *  could not identify — restore must leave it alone rather than guess. */
+val snapshotVersion = 1
 
 val home             = sys.env.getOrElse("HOME", System.getProperty("user.home"))
 // Default save location when --state is not specified
@@ -174,23 +186,34 @@ def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   if (!isTmuxRunning) { return }
 
   // Fetch session/window/layout/pane/command info per pane in one call
-  val format  = "#{session_name}\t#{window_index}\t#{window_name}\t#{window_layout}\t#{pane_index}\t#{pane_current_path}\t#{pane_current_command}"
   val listCmd = session match {
     // Append ":" to the session name to disambiguate. Numeric session names like "0" or "1"
     // would be interpreted as window indexes by tmux without the trailing colon.
-    case Some(s) => Seq("tmux", "list-panes", "-s", "-t", s + ":", "-F", format)
-    case None    => Seq("tmux", "list-panes", "-a", "-F", format)
+    case Some(s) => Seq("tmux", "list-panes", "-s", "-t", s + ":", "-F", listFormat)
+    case None    => Seq("tmux", "list-panes", "-a", "-F", listFormat)
   }
   runCapture(listCmd) match {
     case None => return
     case Some(raw) => {
-      val captured = buildWindows(raw.trim.linesIterator.toList)
+      val lines    = raw.trim.linesIterator.toList
+      val panes    = parseListPanes(lines)
+      val captured = buildWindows(panes, claudeSessionIdsByPanePid(panes.map(_.panePid).toSet))
+      // tmux reported panes but none of them parsed, which means the format string and the parser
+      // have diverged. Writing now would replace a good snapshot with an empty one, and dump runs
+      // unattended on a timer, so that loss would go unnoticed until a restore was needed.
+      // list-panes exits non-zero for an unknown session, so --session cannot reach this branch.
+      if (lines.nonEmpty && captured.isEmpty) {
+        System.err.println(
+          s"tmux-snapshot: parsed 0 pane(s) from ${lines.size} line(s) of tmux output; leaving $stateFile unchanged"
+        )
+        return
+      }
       // With --session: merge into existing snapshot; without: replace all windows.
       val windows = session match {
         case Some(s) => readSnapshot(stateFile).map(_.windows).getOrElse(Nil).filterNot(_.session == s) ++ captured
         case None    => captured
       }
-      val snapshot = Snapshot(version = 0, savedAt = java.time.Instant.now().toString, windows = windows)
+      val snapshot = Snapshot(version = snapshotVersion, savedAt = java.time.Instant.now().toString, windows = windows)
       Option(stateFile.getParent).foreach(Files.createDirectories(_))
       Files.write(stateFile, snapshot.asJson.spaces2.getBytes(StandardCharsets.UTF_8))
       println(s"Saved ${captured.size} window(s), ${captured.map(_.panes.size).sum} pane(s) → $stateFile")
@@ -198,43 +221,23 @@ def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   }
 }
 
-/** Converts a list of tab-separated lines into a list of WindowState, preserving window order. */
-def buildWindows(lines: List[String]): List[WindowState] = {
-  case class RawPane(
-    session: String,
-    windowIndex: Int,
-    windowName: String,
-    windowLayout: String,
-    paneIndex: Int,
-    currentPath: String,
-    command: String
-  )
-
-  val rawPanes: List[RawPane] = lines.flatMap { line =>
-    line.split("\t") match {
-      case Array(session, widxStr, wname, layout, pidxStr, path, cmd) =>
-        for {
-          widx <- widxStr.toIntOption
-          pidx <- pidxStr.toIntOption
-        } yield RawPane(session, widx, wname, layout, pidx, path, cmd)
-      case _ => None
-    }
-  }
-
+/** Converts parsed panes into a list of WindowState, preserving the order tmux reported
+ *  windows in. */
+def buildWindows(panes: List[ListRawPane], claudeSessionIds: Map[Int, String]): List[WindowState] = {
   // Group by (session, windowIndex) using LinkedHashMap to preserve insertion order
-  val grouped = scala.collection.mutable.LinkedHashMap.empty[(String, Int), List[RawPane]]
-  rawPanes.foreach { rp =>
-    val key = (rp.session, rp.windowIndex)
-    grouped(key) = grouped.getOrElse(key, Nil) :+ rp
+  val grouped = scala.collection.mutable.LinkedHashMap.empty[(String, Int), List[ListRawPane]]
+  panes.foreach { p =>
+    val key = (p.session, p.windowIndex)
+    grouped(key) = grouped.getOrElse(key, Nil) :+ p
   }
 
-  grouped.toList.map { case ((session, widx), panes) =>
-    val sorted     = panes.sortBy(_.paneIndex)
+  grouped.toList.map { case ((session, widx), ps) =>
+    val sorted     = ps.sortBy(_.paneIndex)
     val windowName = sorted.head.windowName
     val layout     = sorted.head.windowLayout
-    val paneStates = sorted.map { rp =>
-      val (gitRoot, branch, isWorktree) = gitInfo(rp.currentPath)
-      PaneState(rp.paneIndex, rp.currentPath, rp.command, gitRoot, branch, isWorktree)
+    val paneStates = sorted.map { p =>
+      val (gitRoot, branch, isWorktree) = gitInfo(p.currentPath)
+      PaneState(p.paneIndex, p.currentPath, p.command, gitRoot, branch, isWorktree, claudeSessionIds.get(p.panePid))
     }
     WindowState(session, widx, windowName, layout, paneStates)
   }
@@ -295,8 +298,8 @@ def restore(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
           // inside a live tmux session.
           println(s"Session '$sessionName' already exists; skipping restore for it.")
         } else {
-          createWindow(sessionName, sorted.head, isFirstWindow = true)
-          sorted.tail.foreach(w => createWindow(sessionName, w, isFirstWindow = false))
+          createWindow(sessionName, sorted.head, isFirstWindow = true, version = snap.version)
+          sorted.tail.foreach(w => createWindow(sessionName, w, isFirstWindow = false, version = snap.version))
         }
       }
       println("Done.")
@@ -304,27 +307,44 @@ def restore(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   }
 }
 
-/** Resolves the working directory for a pane. Returns currentPath if it exists,
- *  falls back to gitRoot (useful when a worktree is gone but the repo remains),
- *  then to home. Always returns a valid directory so window creation never fails
- *  due to a missing path, even for the first pane of a session. */
+def isDir(p: String): Boolean = {
+  try { Files.isDirectory(Paths.get(p)) }
+  catch { case _: Throwable => false }
+}
+
+/** The pane's saved directory, or None once it is gone. Callers that must know whether the pane
+ *  was placed where it was saved use this rather than resolveDir, which hides the difference. */
+def savedDir(pane: PaneState): Option[String] = Some(pane.currentPath).filter(isDir)
+
+/** Resolves the working directory for a pane. Returns currentPath if it exists, falls back to
+ *  gitRoot, then to home. Always returns a valid directory so window creation never fails due to
+ *  a missing path, even for the first pane of a session.
+ *
+ *  The gitRoot fallback only helps when the pane sat in a subdirectory of a repository and that
+ *  subdirectory alone was removed. It does not rescue a deleted linked worktree: gitInfo records
+ *  `git rev-parse --show-toplevel`, which inside a linked worktree is the worktree itself, so
+ *  gitRoot ceases to exist along with it and the pane falls through to home. */
 def resolveDir(pane: PaneState): String = {
-  def isDir(p: String): Boolean = {
-    try { Files.isDirectory(Paths.get(p)) }
-    catch { case _: Throwable => false }
+  savedDir(pane).orElse(pane.gitRoot.filter(isDir)).getOrElse(home)
+}
+
+/** Session ids are pasted into a pane's shell by send-keys, where any character the shell treats
+ *  specially would run as a command. Ids are UUIDs, so anything outside that character set is
+ *  refused instead of quoted. */
+def isSafeSessionId(id: String): Boolean = {
+  id.nonEmpty && id.length <= 64 && id.forall { c =>
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_'
   }
-  if (isDir(pane.currentPath)) { pane.currentPath }
-  else { pane.gitRoot.filter(isDir).getOrElse(home) }
 }
 
 /** Restores one window. Additional panes are added with split-window and the saved layout
- *  is applied at the end. Panes that were running claude receive "claude -c" to resume
- *  the conversation.
+ *  is applied at the end. Panes that were running claude may receive a resume command; see
+ *  resumeClaude for the conditions.
  *
  *  Pane and window targets use tmux's immutable IDs (pane_id=%N, window_id=@N) rather than
  *  indexes (session:window.pane). Indexes are renumbered on session creation and diverge from
  *  saved values; immutable IDs are fixed at creation and always point to the right target. */
-def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit = {
+def createWindow(session: String, w: WindowState, isFirstWindow: Boolean, version: Int): Unit = {
   val sortedPanes = w.panes.sortBy(_.paneIndex)
   val firstPane   = sortedPanes.head
 
@@ -366,13 +386,39 @@ def createWindow(session: String, w: WindowState, isFirstWindow: Boolean): Unit 
           .foreach(winId => Process(Seq("tmux", "select-layout", "-t", winId, w.windowLayout)).!)
       }
 
-      // Send "claude -c" to panes that were running claude to resume the most recent
-      // conversation in that directory (-c skips the picker).
       paneMapping.foreach { case (paneId, savedPane) =>
-        if (savedPane.runningCommand == "claude") {
-          Process(Seq("tmux", "send-keys", "-t", paneId, "claude -c", "Enter")).!
-        }
+        if (savedPane.runningCommand == "claude") { resumeClaude(session, w, paneId, savedPane, version) }
       }
+    }
+  }
+}
+
+/** Reopens the Claude conversation a pane was holding, and reports on stdout what each pane got
+ *  or why it got nothing, so a manual restore can be checked.
+ *
+ *  `claude --resume <id>` reopens one identified conversation. `claude -c` does not: it takes the
+ *  most recent conversation of the current directory, so several panes sharing a directory all
+ *  land on the same one, and a worktree pane picks up a conversation that belongs elsewhere. It
+ *  is therefore used only for version 0 snapshots, which carry no ids at all. In a version 1
+ *  snapshot a missing id means dump could not identify the session, and guessing there would
+ *  reintroduce exactly that bug.
+ *
+ *  Nothing is sent when the pane could not be placed in its saved directory: the conversation
+ *  belongs to that tree, and resuming it from the fallback directory would misattribute it. */
+def resumeClaude(session: String, w: WindowState, paneId: String, pane: PaneState, version: Int): Unit = {
+  val label = s"$session:${w.windowIndex}.${pane.paneIndex} ($paneId)"
+  def send(cmd: String): Unit = {
+    Process(Seq("tmux", "send-keys", "-t", paneId, cmd, "Enter")).!
+    println(s"  $label: sent '$cmd'")
+  }
+  if (savedDir(pane).isEmpty) {
+    println(s"  $label: saved directory ${pane.currentPath} is gone; left as a shell")
+  } else {
+    pane.claudeSessionId match {
+      case Some(id) if isSafeSessionId(id) => send(s"claude --resume $id")
+      case Some(_)                         => println(s"  $label: recorded session id is not a plausible id; left as a shell")
+      case None if version <= 0            => send("claude -c")
+      case None                            => println(s"  $label: no session id was recorded; left as a shell")
     }
   }
 }
@@ -444,12 +490,11 @@ case class Listing(
   windows: List[WindowInfo]
 ) derives Codec.AsObject
 
-/** Raw tmux fields for one pane, in listFormat order.
+/** Raw tmux fields for one pane, in listFormat order. Both `dump` and `list` go through this
+ *  parser, so the two subcommands cannot drift apart in what they ask tmux for.
  *
- *  This parser is deliberately separate from buildWindows. buildWindows matches a fixed
- *  7-element Array, so adding fields to dump's format string would send every pane to its
- *  `case _ => None` branch and make dump write an empty snapshot. dump runs unattended on a
- *  timer, so that failure would go unnoticed. */
+ *  `dump` uses a subset of the fields; pane_id, pane_pid and pane_tty exist for `list`, except
+ *  that pane_pid also lets `dump` attribute a Claude session to the pane hosting it. */
 case class ListRawPane(
   session: String,
   windowId: String,
@@ -603,8 +648,28 @@ def findAncestor(pid: Int, targets: Set[Int], parents: Map[Int, Int], maxDepth: 
   found
 }
 
-/** Live Claude Code sessions, keyed by the pane_pid of the pane that hosts them. */
-def collectClaudeSessions(panePids: Set[Int], parents: Map[Int, Int]): Map[Int, ClaudeSessionInfo] = {
+/** Live Claude Code sessions, keyed by the pane_pid of the pane that hosts them. Where a pane
+ *  claims several sessions the last one wins, which is good enough for display. */
+def collectClaudeSessions(panePids: Set[Int], parents: Map[Int, Int]): Map[Int, ClaudeSessionInfo] =
+  claudeSessionClaims(panePids, parents).toMap
+
+/** Session ids to record in a snapshot, keyed by pane_pid.
+ *
+ *  Only panes that resolve to exactly one session are included. Restoring the wrong conversation
+ *  is worse than restoring none, so an ambiguous pane is dropped here and left for restore to
+ *  skip, rather than resolved by an arbitrary rule. */
+def claudeSessionIdsByPanePid(panePids: Set[Int]): Map[Int, String] = {
+  claudeSessionClaims(panePids, processParents).groupBy(_._1).flatMap { case (panePid, claims) =>
+    claims.map(_._2.sessionId).distinct match {
+      case id :: Nil => Some(panePid -> id)
+      case _         => None
+    }
+  }
+}
+
+/** Every (pane_pid, session) pair the ~/.claude/sessions scan yields, before duplicates are
+ *  collapsed. Callers that must detect an ambiguous pane need the pairs, not the map. */
+def claudeSessionClaims(panePids: Set[Int], parents: Map[Int, Int]): List[(Int, ClaudeSessionInfo)] = {
   jsonFilesIn(Paths.get(home, ".claude", "sessions")).flatMap { f =>
     for {
       raw <- readJson[RawClaudeSession](f.toPath)
@@ -621,7 +686,7 @@ def collectClaudeSessions(panePids: Set[Int], parents: Map[Int, Int]): Map[Int, 
       updatedAt = raw.updatedAt.map(isoFromMillis),
       firstUserMessage = firstUserMessageOf(raw.cwd, raw.sessionId)
     )
-  }.toMap
+  }
 }
 
 /** Maps a working directory to its ~/.claude/projects subdirectory name, which replaces every
