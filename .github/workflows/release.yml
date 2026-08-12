@@ -83,9 +83,13 @@ jobs:
         with:
           subject-path: release/tmux-snapshot-*
 
+      # fail_on_unmatched_files defaults to false, which would publish a release
+      # with no assets attached if the glob matched nothing. That failure is
+      # silent until someone tries to download, so it is opted out of.
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: v${{ steps.version.outputs.version }}
           generate_release_notes: true
           files: release/*
+          fail_on_unmatched_files: true
