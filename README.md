@@ -2,13 +2,13 @@
 
 Save and restore your tmux working environment — built for parallel [Claude Code](https://claude.com/claude-code) sessions.
 
-When you run several Claude Code sessions across tmux windows — one per git worktree, say — an unexpected shutdown (a drained battery, a kernel panic) wipes all of it: the windows, the directory each was in, and the running Claude conversations. Rebuilding that by hand is tedious. `tmux-snapshot` periodically saves your tmux layout and restores it with a single command, including resuming each Claude Code conversation via `claude -c`.
+When you run several Claude Code sessions across tmux windows — one per git worktree, say — an unexpected shutdown (a drained battery, a kernel panic) wipes all of it: the windows, the directory each was in, and the running Claude conversations. Rebuilding that by hand is tedious. `tmux-snapshot` periodically saves your tmux layout and restores it with a single command, including resuming the exact Claude Code conversation each pane was in, by session ID.
 
 ## How it works
 
 - **`dump`** serializes your tmux sessions — windows, panes, working directories, layout, and the command running in each pane — to JSON.
 - A **systemd user timer** runs `dump` on an interval, so the snapshot stays current.
-- **`restore`** rebuilds your sessions from the latest snapshot: for each saved session it recreates windows and panes in their original order and directories, reapplies pane layouts, and sends `claude -c` to any pane that was running Claude Code so the conversation resumes where it left off.
+- **`restore`** rebuilds your sessions from the latest snapshot: for each saved session it recreates windows and panes in their original order and directories, reapplies pane layouts, and for each pane that was running Claude Code and has a recorded session ID, resumes that exact conversation with `claude --resume <session-id>`.
 - **`list`** inspects your current tmux state — windows, panes, and any active Claude Code sessions or agents — without touching the snapshot.
 
 Every session is saved and restored under its original name. See [Design contract](#design-contract).
@@ -19,14 +19,14 @@ Every session is saved and restored under its original name. See [Design contrac
 - **Safe to re-run** — `restore` skips any session that already exists, so it never duplicates windows if you run it twice or invoke it from inside a live session.
 - **Robust targeting via tmux's immutable pane/window IDs** (`%N` / `@N`) rather than indexes, so restoration stays correct even when window numbering differs from the saved state.
 - **Backups are never clobbered** — `dump` will not overwrite a good snapshot with an empty one.
-- **Claude Code conversations resume automatically** on restore.
+- **The exact conversation a pane was having resumes on restore**, by session ID, rather than whatever conversation happens to be latest for that directory.
 - **Read-only inspection of Claude Code sessions and agents** via `list` — see which panes are running Claude, what their session state is, and which agents are active, without modifying your snapshot.
 
 ## Requirements
 
 - [tmux](https://github.com/tmux/tmux)
 - git
-- [Claude Code](https://claude.com/claude-code) (`claude`) — for conversation resume
+- [Claude Code](https://claude.com/claude-code) (`claude`), version 2.1.223 or later — for conversation resume by session ID (`claude --resume <session-id>`, which resolves IDs across projects starting from that version)
 - To build: [scala-cli](https://scala-cli.virtuslab.org/) and an LLVM/Clang toolchain (a Scala Native requirement)
 
 ## Installation
@@ -60,7 +60,7 @@ tmux-snapshot restore
 tmux attach            # or: tmux attach -t <session-name>
 ```
 
-`restore` recreates each saved session (as a detached session) and resumes each Claude conversation. You can also run `dump` / `restore` manually at any time.
+`restore` recreates each saved session (as a detached session) and resumes the conversation each Claude pane was holding. It prints one line per Claude pane saying what it sent, or why it sent nothing. You can also run `dump` / `restore` manually at any time.
 
 ### Choosing the snapshot file
 
@@ -139,12 +139,14 @@ When you pass `--json`, `list` returns the same information in machine-readable 
 - **`dump` never destroys a good snapshot.** If tmux is not running (e.g. just after a reboot, before you restore), `dump` does nothing and leaves the last good `state.json` intact.
 - **`restore` is decided per session by name.** For each saved session, if a session with that name already exists, `restore` warns and leaves it untouched; otherwise it is rebuilt. This makes `restore` safe to run more than once and from inside a live tmux session.
 - **Immutable IDs.** Windows and panes are targeted by tmux IDs captured at creation, never by index.
-- **Missing directories degrade gracefully.** If a pane's saved directory no longer exists, `restore` falls back to the git repository root, then to `$HOME`, so a window is always created.
+- **Missing directories degrade gracefully, but Claude is not resumed there.** If a pane's saved directory no longer exists, `restore` falls back to the git repository root, then to `$HOME`, so a window is always created — but no `claude` command is sent to that pane, because resuming the saved conversation in a different directory would misattribute it. The git-repository-root fallback only helps when the pane's own subdirectory vanished while the rest of the repository is still there; it cannot recover a removed linked worktree, because the git root recorded for a worktree pane is the worktree's own path, which disappears along with the worktree.
+- **Snapshot version determines resume behavior.** Snapshots written before session-ID tracking are `version: 0` and carry no per-pane session ID, so `restore` falls back to `claude -c` for panes that were running Claude Code. `version: 1` snapshots carry a `claudeSessionId` per pane when one could be determined uniquely; `restore` sends `claude --resume <session-id>` for those panes and sends nothing to a Claude pane with no recorded ID, rather than guessing with `claude -c`.
 
 ## Limitations
 
 - Directories and git worktrees are not recreated — `restore` assumes the saved paths still exist (and falls back gracefully when they do not).
-- Resuming a pane's program is limited to Claude Code (`claude -c`); other running programs are not relaunched.
+- Resuming a pane's program is limited to Claude Code, and only when a session ID was recorded for that pane; other running programs are not relaunched.
+- Cross-project session resolution only succeeds when exactly one other project holds a transcript for that session ID. If that condition is not met, `claude --resume <session-id>` prints `No conversation found with session ID: <id>` and exits 1, leaving the pane at a shell prompt — `restore` does not fall back to an interactive picker. This failure is visible on the pane rather than silent, which is the intended trade-off against resuming the wrong conversation.
 
 ## License
 
