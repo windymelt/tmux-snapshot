@@ -184,7 +184,18 @@ def dump(stateFile: java.nio.file.Path, session: Option[String]): Unit = {
   runCapture(listCmd) match {
     case None => return
     case Some(raw) => {
-      val captured = buildWindows(raw.trim.linesIterator.toList)
+      val lines    = raw.trim.linesIterator.toList
+      val captured = buildWindows(lines)
+      // tmux reported panes but none of them parsed, which means the format string and the parser
+      // have diverged. Writing now would replace a good snapshot with an empty one, and dump runs
+      // unattended on a timer, so that loss would go unnoticed until a restore was needed.
+      // list-panes exits non-zero for an unknown session, so --session cannot reach this branch.
+      if (lines.nonEmpty && captured.isEmpty) {
+        System.err.println(
+          s"tmux-snapshot: parsed 0 pane(s) from ${lines.size} line(s) of tmux output; leaving $stateFile unchanged"
+        )
+        return
+      }
       // With --session: merge into existing snapshot; without: replace all windows.
       val windows = session match {
         case Some(s) => readSnapshot(stateFile).map(_.windows).getOrElse(Nil).filterNot(_.session == s) ++ captured
