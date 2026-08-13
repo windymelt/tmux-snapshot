@@ -70,25 +70,17 @@ jobs:
       - name: Build native binary
         run: ./build.sh
 
-      # The runner has no tmux server, so `dump` returns via its safety guard
-      # and `list` exits 1. Both still traverse process startup, which is what
-      # a Scala Native miscompilation would break. The loop catches an
-      # intermittent crash that a single run would miss; a segfault shows up as
-      # 139 rather than the expected status.
-      #
-      # --state must be passed so the run never touches a real snapshot.
+      - name: Install tmux
+        run: sudo apt-get install -y --no-install-recommends tmux
+
+      # `list` needs --session or --all when it is not run from inside tmux.
       - name: Smoke-test the binary
         run: |
-          for i in $(seq 1 25); do
-            ./tmux-snapshot --state "$RUNNER_TEMP/smoke.json" dump
-
-            status=0
-            ./tmux-snapshot list || status=$?
-            if [ "$status" -ne 1 ]; then
-              echo "iteration $i: 'list' exited with $status, expected 1" >&2
-              exit 1
-            fi
-          done
+          tmux new-session -d -s smoke
+          ./tmux-snapshot --state "$RUNNER_TEMP/smoke.json" dump
+          grep -q '"smoke"' "$RUNNER_TEMP/smoke.json"
+          ./tmux-snapshot --all list
+          ./tmux-snapshot --session smoke --json list
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
