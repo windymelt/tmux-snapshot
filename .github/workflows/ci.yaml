@@ -81,6 +81,9 @@ jobs:
           grep -q '"smoke"' "$RUNNER_TEMP/smoke.json"
           ./tmux-snapshot --all list
           ./tmux-snapshot --session smoke --json list
+          # CI never sets TMUX_SNAPSHOT_VERSION, so the placeholder is the
+          # expected value here; asserting it catches a BuildInfo wiring break.
+          ./tmux-snapshot --version | grep -q '0\.0\.0-SNAPSHOT'
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
