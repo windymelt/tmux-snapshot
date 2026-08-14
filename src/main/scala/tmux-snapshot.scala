@@ -8,6 +8,7 @@ import scopt.OParser
 import scala.scalanative.unsafe.*
 import scala.scalanative.posix.unistd
 import cue4s.*
+import buildinfo.BuildInfo
 
 /** Per-pane state. runningCommand is the foreground command name at dump time.
  *
@@ -69,6 +70,10 @@ val cliParser = {
   import builder.*
   OParser.sequence(
     programName("tmux-snapshot"),
+    // scopt renders `--version` as the concatenated `head` text, and prepends the
+    // same line to `--help`. Without a `head`, `--version` would print an empty
+    // line, so the two are added together.
+    head("tmux-snapshot", BuildInfo.version),
     opt[String]("state")
       .valueName("<path>")
       .action((x, c) => c.copy(stateFile = Paths.get(x)))
@@ -84,6 +89,7 @@ val cliParser = {
       .action((_, c) => c.copy(all = true))
       .text("target every session (list only)"),
     help("help").text("show this message"),
+    version("version").text("show the version and exit"),
     arg[String]("<command>")
       .action((x, c) => c.copy(command = x))
       .validate(x =>
