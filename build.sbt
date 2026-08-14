@@ -1,10 +1,18 @@
 import scala.scalanative.build.*
 
-enablePlugins(ScalaNativePlugin)
+enablePlugins(ScalaNativePlugin, BuildInfoPlugin)
 
 name         := "tmux-snapshot"
 organization := "windymelt"
-version      := "0.1.0-SNAPSHOT"
+// Release builds set TMUX_SNAPSHOT_VERSION from the git tag (see release.yml).
+// Local and CI builds report a placeholder so `--version` never claims a
+// release that was not tagged. An empty value is treated the same as unset,
+// because a workflow that always exports the variable would otherwise inject
+// an empty version string.
+version := sys.env
+  .get("TMUX_SNAPSHOT_VERSION")
+  .filter(_.nonEmpty)
+  .getOrElse("0.0.0-SNAPSHOT")
 scalaVersion := "3.3.8"
 
 Compile / mainClass := Some("Main")
