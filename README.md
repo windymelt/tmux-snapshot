@@ -136,6 +136,18 @@ tmux attach            # or: tmux attach -t <session-name>
 
 `restore` recreates each saved session (as a detached session) and resumes the conversation each Claude pane was holding. It prints one line per Claude pane saying what it sent, or why it sent nothing. You can also run `dump` / `restore` manually at any time.
 
+### Checking the version
+
+Check the binary's version with `--version`:
+
+```sh
+tmux-snapshot --version
+```
+
+For prebuilt binaries downloaded from [Releases](https://github.com/windymelt/tmux-snapshot/releases), the output is the release tag, e.g. `1.2.3`.
+
+When you build from source (with `sbt nativeLink` or `./build.sh`), the version is `0.0.0-SNAPSHOT` unless you explicitly set the `TMUX_SNAPSHOT_VERSION` environment variable at build time. This makes it easy to distinguish self-built binaries from officially released ones and prevents an untagged source build from impersonating a release version.
+
 ### Choosing the snapshot file
 
 By default the snapshot is read from and written to `~/.local/share/tmux-snapshot/state.json`. Pass `--state <path>` to use a different file:
