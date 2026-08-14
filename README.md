@@ -144,9 +144,19 @@ Check the binary's version with `--version`:
 tmux-snapshot --version
 ```
 
-For prebuilt binaries downloaded from [Releases](https://github.com/windymelt/tmux-snapshot/releases), the output is the release tag, e.g. `1.2.3`.
+For prebuilt binaries downloaded from [Releases](https://github.com/windymelt/tmux-snapshot/releases), the output includes the release tag, e.g.:
 
-When you build from source (with `sbt nativeLink` or `./build.sh`), the version is `0.0.0-SNAPSHOT` unless you explicitly set the `TMUX_SNAPSHOT_VERSION` environment variable at build time. This makes it easy to distinguish self-built binaries from officially released ones and prevents an untagged source build from impersonating a release version.
+```
+tmux-snapshot 1.2.3
+```
+
+When you build from source (with `sbt nativeLink` or `./build.sh`), the output is the placeholder below unless you explicitly set the `TMUX_SNAPSHOT_VERSION` environment variable at build time:
+
+```
+tmux-snapshot 0.0.0-SNAPSHOT
+```
+
+This makes it easy to distinguish self-built binaries from officially released ones and prevents an untagged source build from impersonating a release version.
 
 ### Choosing the snapshot file
 
